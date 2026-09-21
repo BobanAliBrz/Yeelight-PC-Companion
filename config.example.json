@@ -1,0 +1,42 @@
+{
+    "config_version": 2,
+    "location": {
+        "latitude": "0.0000",
+        "longitude": "0.0000",
+        "elevation": 0.0,
+        "light_buffer_hours": 2.0
+    },
+    "lights": {
+        "devices": []
+    },
+    "paths": {
+        "openrgb": "",
+        "yeelight_connector": "",
+        "razer_synapse": "",
+        "artemis": ""
+    },
+    "integrations": {
+        "openrgb": {
+            "enabled": false
+        },
+        "yeelight_connector": {
+            "enabled": false
+        },
+        "razer_synapse": {
+            "enabled": false
+        },
+        "artemis": {
+            "enabled": false
+        }
+    },
+    "automation": {
+        "close_apps_on_sleep": true,
+        "turn_off_yeelight_on_sleep": true,
+        "restore_apps_on_wake": true,
+        "turn_on_yeelight_on_wake_night": true,
+        "force_silent_launch": true,
+        "launch_razer_synapse": false,
+        "wait_for_razer_synapse": true,
+        "razer_synapse_timeout_seconds": 45.0
+    }
+}

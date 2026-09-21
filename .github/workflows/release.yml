@@ -1,0 +1,114 @@
+name: Release build
+
+# Triggered by pushing a version tag such as `v1.0.0`, or manually.
+#
+# This workflow BUILDS and UPLOADS ARTIFACTS TO THE WORKFLOW RUN ONLY. It does
+# not create a GitHub Release and does not publish anything. Publishing is a
+# separate, deliberate step (see README "Releasing"), so a mis-tagged build
+# cannot accidentally become public.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip the unit test suite (packaging iteration only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build installer + portable ZIP
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install runtime and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-build.txt
+
+      # Inno Setup is not on the GitHub-hosted Windows image. Installing it from
+      # the official winget package keeps this reproducible and avoids opaque
+      # third-party setup actions. Pinned by exact package id (version is
+      # reported in the log for auditability).
+      - name: Install Inno Setup
+        run: |
+          winget install --id JRSoftware.InnoSetup --exact `
+            --accept-source-agreements --accept-package-agreements `
+            --disable-interactivity
+        shell: pwsh
+
+      - name: Locate Inno Setup compiler
+        run: |
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe was not found after installing Inno Setup.' }
+          $iscc | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "ISCC: $iscc"
+          Split-Path -Parent $iscc | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+
+      # `inputs.skip_tests` is a GitHub Actions *boolean*, not a PowerShell one.
+      # Interpolating it into a PowerShell `if (...)` (the old
+      # `if (${{ inputs.skip_tests == true }})`) renders `if (True)`/`if (False)`,
+      # which is not PowerShell syntax and is a silent trap. The decision is
+      # therefore made by the workflow engine itself, with two plain steps.
+      #
+      # `YPC_PRIVATE_VALUES` is optional. When the maintainer configures the
+      # `YPC_PRIVATE_VALUES` repository secret (one exact private value per
+      # line), the release build's privacy scan rejects the maintainer's real
+      # coordinates / LAN addresses / author e-mail / checkout path / user name
+      # if any of them ever reaches an artifact. With no secret configured the
+      # scan still runs its generic rules and nothing else. The values are never
+      # stored in this repository - not even as a truncated fingerprint - and
+      # the build works either way. See tools/release_privacy_scan.py.
+      - name: Build release artifacts
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        run: ./build_release.ps1
+        shell: pwsh
+        env:
+          YPC_PRIVATE_VALUES: ${{ secrets.YPC_PRIVATE_VALUES }}
+
+      - name: Build release artifacts (packaging iteration, tests skipped)
+        if: github.event_name == 'workflow_dispatch' && inputs.skip_tests
+        run: ./build_release.ps1 -SkipTests
+        shell: pwsh
+        env:
+          YPC_PRIVATE_VALUES: ${{ secrets.YPC_PRIVATE_VALUES }}
+
+      - name: Collect artifact checksums
+        run: |
+          Get-ChildItem release | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash
+            "$hash  $($_.Name)" | Tee-Object -Append -FilePath release/SHA256SUMS.txt
+          }
+        shell: pwsh
+
+      - name: Upload installer and portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            release/*-setup.exe
+            release/*-portable.zip
+            release/SHA256SUMS.txt

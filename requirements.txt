@@ -1,0 +1,14 @@
+# Runtime dependencies for Yeelight PC Companion.
+#
+#     python -m pip install -r requirements.txt
+#
+# PyInstaller and the other packaging tools live in requirements-build.txt; they
+# are only needed to produce the installer/portable artifacts.
+#
+# These are the exact versions the Stage 7 release build was verified against.
+# Pinning the heavy, fast-moving dependency (PyQt6) as well as the already-pinned
+# ones keeps a rebuild reproducible.
+PyQt6==6.11.0
+yeelight==0.7.14
+ephem==4.1.5
+requests==2.31.0

@@ -1,0 +1,6 @@
+# Test-only dependencies for Yeelight PC Companion.
+#
+# Runtime users do not need these. CI installs this file directly, while
+# requirements-build.txt includes it because the release pipeline runs the
+# unit suite before packaging.
+PyYAML==6.0.2

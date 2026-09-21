@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------
+# Local configuration — contains real device IPs, geographic
+# coordinates and machine-specific paths. Never commit this.
+# Use config.example.json as the template instead.
+# ---------------------------------------------------------------
+config.json
+
+# Configuration backups created before an import, migration or major
+# replacement. They contain exactly the same private data as config.json.
+config.json.bak
+config.json.bak.*
+
+# Temporary files used by the atomic config write (write temp -> os.replace).
+# A crash could leave one behind in the data directory.
+.config-*.tmp
+
+# Exported configurations (the filename the Export dialog suggests).
+yeelight-pc-companion-config.json
+
+# ---------------------------------------------------------------
+# Local private-value source for the release privacy scanner.
+# Holds the maintainer's EXACT real coordinates / LAN addresses /
+# author e-mail / checkout path / user name as plain text, so that
+# tools/release_privacy_scan.py can reject them without any of those
+# values (or a truncated fingerprint of them) ever entering tracked
+# source. Never commit this file, and never commit a file derived
+# from it. See tools/release_privacy_scan.py.
+# ---------------------------------------------------------------
+private_values.local.txt
+private_values.local.*
+private_values*.local.txt
+
+# Portable-mode marker: a machine-local opt-in next to the executable that
+# switches config/log storage to the application directory. Never source.
+portable.flag
+
+# ---------------------------------------------------------------
+# Runtime logs (rotating handler keeps .1 .2 .3 backups)
+# ---------------------------------------------------------------
+yeelight_pc_companion_debug.log
+yeelight_pc_companion_debug.log.*
+
+# Legacy debug log left behind by the pre-rename builds. Keep ignoring it
+# so users upgrading from the old Lumina-branded version never commit it.
+lumina_debug.log
+lumina_debug.log.*
+
+# ---------------------------------------------------------------
+# Crash reports written beside the application by the top-level handler
+# ---------------------------------------------------------------
+crash.log
+crash.log.*
+
+# ---------------------------------------------------------------
+# PyInstaller build artifacts
+# ---------------------------------------------------------------
+build/
+dist/
+*.spec.bak
+
+# ---------------------------------------------------------------
+# Release build output (build_release.ps1)
+# ---------------------------------------------------------------
+# Portable payload and the finished installer/portable ZIPs. These are build
+# products: they are produced locally (and by CI) and never committed.
+dist-portable/
+release/
+
+# Generated Inno Setup include. Rendered from app_metadata.py by
+# tools/write_installer_version.py during the release build; the .iss script
+# #includes it and intentionally has no fallback.
+installer/version.iss
+
+# ---------------------------------------------------------------
+# Code signing material — must never enter the repository
+# ---------------------------------------------------------------
+*.pfx
+*.p12
+*.pvk
+*.snk
+*.cer
+*.key
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---------------------------------------------------------------
+# Local agent / editor tooling
+# ---------------------------------------------------------------
+.agents/
+.codex/
+.reasonix/
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------
+# OS noise
+# ---------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,17 @@
+# Build-time dependencies for producing the Windows release artifacts.
+#
+# These are NOT needed to run the application from source. They are needed to
+# produce the PyInstaller bundle that the installer and the portable ZIP ship.
+#
+#     python -m pip install -r requirements-build.txt
+#
+# The pinned version below is the exact PyInstaller that produced the currently
+# verified onedir build (see project_memory.md, Stage 7). It is deliberately
+# pinned rather than floating: PyInstaller changes bundling behaviour between
+# minor releases, so an unpinned build can silently produce a different payload.
+# Bump it only together with a fresh build and test run.
+#
+# Release builds run the unit suite first, so pull in the small test-only
+# dependency set as part of the build environment too.
+-r requirements-test.txt
+pyinstaller==6.21.0

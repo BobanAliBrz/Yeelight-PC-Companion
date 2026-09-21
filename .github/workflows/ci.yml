@@ -1,0 +1,64 @@
+name: CI
+
+# Windows-only: the application binds Win32 power notifications, talks to Task
+# Scheduler and drives a Windows tray icon. The suite mocks or guards every one
+# of those, so no real hardware, LAN, Task Scheduler or UAC access is needed.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Windows, Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-test.txt
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q .
+
+      - name: Import check
+        run: |
+          python -c "import app_metadata, config_manager, windows_tasks, yeelight_devices, yeelight_device_ui, ui_theme, ui_components"
+          python -c "import first_run_wizard"
+
+      - name: Prepare and verify version metadata
+        run: |
+          python tools/write_version_info.py --check
+          # installer/version.iss is generated and intentionally gitignored, so
+          # a clean clone must create it before --check can validate it.
+          python tools/write_installer_version.py
+          python tools/write_installer_version.py --check
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Repository privacy scan
+        run: python tools/release_privacy_scan.py --repo
