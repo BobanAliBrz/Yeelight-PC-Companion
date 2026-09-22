@@ -81,6 +81,10 @@ TASK_XML_VERSION = "1.2"
 # provisioning interface the elevated helper accepts.
 PROVISION_FLAG = "--provision-openrgb-task"
 REMOVE_FLAG = "--remove-openrgb-task"
+# Stop + disable the fixed OpenRGB Windows service after an explicit user
+# action. Like the two flags above, this is a first-argument-only mode with a
+# hardcoded target service name - there is no --service-name parameter.
+DISABLE_OPENRGB_SERVICE_FLAG = "--disable-openrgb-service"
 
 # ---------------------------------------------------------
 # Status model
@@ -100,6 +104,7 @@ STATUS_UNSAFE_TARGET = "unsafe_target"
 ACTION_NONE = "none"
 ACTION_PROVISION = "provision"
 ACTION_REMOVE = "remove"
+ACTION_DISABLE_OPENRGB_SERVICE = "disable_openrgb_service"
 
 SET_UP_ACTION_LABEL = "Set Up Seamless OpenRGB Launch"
 REPAIR_ACTION_LABEL = "Repair OpenRGB Elevation"
@@ -173,11 +178,23 @@ PROVISION_EXIT_MESSAGES = {
 PROVISION_ACTION_SUBJECTS = {
     ACTION_PROVISION: "OpenRGB elevated launch could not be configured.",
     ACTION_REMOVE: "OpenRGB elevated launch could not be removed.",
+    ACTION_DISABLE_OPENRGB_SERVICE: "The OpenRGB Windows service could not be disabled.",
 }
+
+# Identity-mismatch / unverifiable identity is a security-class refusal: the
+# elevated helper must not mutate a service whose executable is not the
+# configured OpenRGB. Reuses PROVISION_EXIT_SECURITY (3) for that class.
+# "Startup disabled but the service failed to stop" is a partial repair and is
+# reported as PROVISION_EXIT_NOT_READY (5), never as success.
 
 # The helper process is waited on directly (no polling); this is only the
 # guard against a broken elevated process hanging the Settings UI forever.
 PROVISIONING_TIMEOUT_SECONDS = 30.0
+# The OpenRGB service repair is an explicit user-action path (UAC already
+# shown), not the ~0.4 s suspend budget. The elevated helper gets a longer,
+# still bounded process-wait; the service-stop wait inside the helper is
+# separately bounded by openrgb_service.OPENRGB_SERVICE_DISABLE_TIMEOUT_SECONDS.
+DISABLE_OPENRGB_SERVICE_HELPER_TIMEOUT_SECONDS = 20.0
 # How long a killed helper's process handle may take to become signalled.
 PROCESS_EXIT_GRACE_SECONDS = 2.0
 SCHTASKS_TIMEOUT_SECONDS = 30.0
@@ -1134,18 +1151,21 @@ def parse_provisioning_argv(argv):
     start. Raises :class:`WindowsTaskError` for a malformed provisioning
     command line.
 
-    The accepted forms are exactly ``--provision-openrgb-task <path>`` and
-    ``--remove-openrgb-task``, as the first argument. There is deliberately no
-    generic ``--run-command`` / ``--task-name`` / ``--arguments`` interface: the
-    task name and the OpenRGB arguments are hardcoded and only the executable
-    path is accepted.
+    The accepted forms are exactly ``--provision-openrgb-task <path>``,
+    ``--remove-openrgb-task`` and ``--disable-openrgb-service <path>``, as the
+    first argument. There is deliberately no generic ``--run-command`` /
+    ``--task-name`` / ``--arguments`` / ``--service-name`` interface: the task
+    name, the OpenRGB arguments and the Windows service name are hardcoded and
+    only the OpenRGB executable path is accepted (as an identity check input
+    for the service repair, never as something to execute).
     """
     args = [str(item) for item in (argv or [])[1:]]
     if not args:
         return None
 
-    if args[0] not in (PROVISION_FLAG, REMOVE_FLAG):
-        if PROVISION_FLAG in args or REMOVE_FLAG in args:
+    known_flags = (PROVISION_FLAG, REMOVE_FLAG, DISABLE_OPENRGB_SERVICE_FLAG)
+    if args[0] not in known_flags:
+        if any(flag in args for flag in known_flags):
             raise WindowsTaskError("A provisioning flag must be the first argument.")
         return None
 
@@ -1153,6 +1173,13 @@ def parse_provisioning_argv(argv):
         if len(args) != 1:
             raise WindowsTaskError(f"{REMOVE_FLAG} does not accept any additional arguments.")
         return ACTION_REMOVE, ""
+
+    if args[0] == DISABLE_OPENRGB_SERVICE_FLAG:
+        if len(args) != 2:
+            raise WindowsTaskError(
+                f"{DISABLE_OPENRGB_SERVICE_FLAG} requires exactly one OpenRGB executable path."
+            )
+        return ACTION_DISABLE_OPENRGB_SERVICE, args[1]
 
     if len(args) != 2:
         raise WindowsTaskError(
@@ -1178,7 +1205,8 @@ def run_provisioning_cli(argv, output=None):
     * :data:`PROVISION_EXIT_TASK_CREATION` (4) - ``schtasks.exe`` refused the
       task definition,
     * :data:`PROVISION_EXIT_NOT_READY` (5) - the task was created but is not
-      usable in its resulting state.
+      usable in its resulting state (also used for a partial OpenRGB service
+      repair, e.g. startup disabled but the service failed to stop).
 
     The same reason is written to the narrow result file so the parent can show
     it verbatim; the numeric code is the fallback when it cannot. Nothing else
@@ -1209,6 +1237,9 @@ def run_provisioning_cli(argv, output=None):
 
 def _perform_provisioning_action(action, path, print_output):
     """Do the one allowed action. Returns ``(exit_code, user_safe_reason)``."""
+    if action == ACTION_DISABLE_OPENRGB_SERVICE:
+        return _perform_disable_openrgb_service(path, print_output)
+
     if action == ACTION_REMOVE:
         try:
             removed = remove_openrgb_task()
@@ -1252,6 +1283,7 @@ def _perform_provisioning_action(action, path, print_output):
     if status.is_ready:
         print_output("OpenRGB elevation task is ready.")
         return PROVISION_EXIT_OK, "OpenRGB seamless elevated launch is ready."
+    # (provision action continues below)
 
     # The task work reported success but the resulting task is not usable. That
     # is a distinct bug from "provisioning failed", so it is reported as its own
@@ -1262,6 +1294,37 @@ def _perform_provisioning_action(action, path, print_output):
     )
     print_output(f"ERROR: {reason}")
     return PROVISION_EXIT_NOT_READY, reason
+
+
+def _perform_disable_openrgb_service(path, print_output):
+    """Elevated-helper body of ``--disable-openrgb-service <expected-path>``.
+
+    The path is the **expected** OpenRGB executable used only for identity
+    verification. The service name is the hardcoded ``OpenRGB`` constant; this
+    helper can never mutate any other service.
+    """
+    # Imported lazily so a plain application start does not pay for the SCM
+    # bindings, and so tests can patch openrgb_service independently.
+    import openrgb_service
+
+    try:
+        validated = validate_openrgb_executable(path)
+    except WindowsTaskError as exc:
+        print_output(f"ERROR: {exc}")
+        return PROVISION_EXIT_FAILED, str(exc)
+
+    result = openrgb_service.disable_openrgb_service(validated)
+    if result.ok:
+        print_output(result.message)
+        return PROVISION_EXIT_OK, result.message
+
+    print_output(f"ERROR: {result.message}")
+    # 3 = identity/security refusal; 5 = partial repair; else generic failure.
+    if result.exit_code == 3:
+        return PROVISION_EXIT_SECURITY, result.message
+    if result.exit_code == 5:
+        return PROVISION_EXIT_NOT_READY, result.message
+    return PROVISION_EXIT_FAILED, result.message
 
 
 def _print(message):  # pragma: no cover - console mode only
@@ -2309,6 +2372,11 @@ def _declined_message(action=ACTION_PROVISION):
             "Administrator approval was declined, so the OpenRGB launch task "
             "could not be removed."
         )
+    if action == ACTION_DISABLE_OPENRGB_SERVICE:
+        return (
+            "Administrator approval was declined, so the OpenRGB Windows service "
+            "was not stopped or disabled. Nothing was changed."
+        )
     return (
         "Administrator approval was declined, so OpenRGB cannot be started "
         "after wake without a UAC prompt yet."
@@ -2325,6 +2393,12 @@ def _outcome_from_exit_code(exit_code, detail, status, action=ACTION_PROVISION):
     """Turn the helper's exit code (and result) into a user-facing outcome."""
     subject = _action_subject(action)
     if exit_code == PROVISION_EXIT_OK:
+        if action == ACTION_DISABLE_OPENRGB_SERVICE:
+            return ProvisionOutcome(
+                True,
+                detail or "The OpenRGB Windows service is stopped and disabled.",
+                0,
+            )
         # The helper reported success, so the task must exist and be usable. If
         # the inspection disagrees, that is its own bug and is reported as one.
         if status is not None and status.is_ready:
@@ -2398,10 +2472,13 @@ def run_elevated_provisioning(
     clock = clock or time.time
 
     try:
-        argv = _self_invocation(
-            [PROVISION_FLAG if action == ACTION_PROVISION else REMOVE_FLAG]
-            + ([validated_path] if action == ACTION_PROVISION else [])
-        )
+        if action == ACTION_PROVISION:
+            cli = [PROVISION_FLAG, validated_path]
+        elif action == ACTION_DISABLE_OPENRGB_SERVICE:
+            cli = [DISABLE_OPENRGB_SERVICE_FLAG, validated_path]
+        else:
+            cli = [REMOVE_FLAG]
+        argv = _self_invocation(cli)
     except WindowsTaskError as exc:
         return ProvisionOutcome(False, str(exc))
 
@@ -2452,6 +2529,14 @@ def run_elevated_provisioning(
 
     if exit_code is None:
         log_provisioning("The elevated helper did not finish within the timeout.")
+        if action == ACTION_DISABLE_OPENRGB_SERVICE:
+            return ProvisionOutcome(
+                False,
+                "The OpenRGB Windows service repair did not finish within "
+                f"{int(max(0.0, float(timeout_seconds)))} seconds. Nothing is "
+                "reported as changed without verification.",
+                None,
+            )
         status = _safe_status(status_query, validated_path)
         if status is not None and status.is_ready:
             # It may have finished the task and only failed to report back.
@@ -2466,7 +2551,7 @@ def run_elevated_provisioning(
             None,
         )
 
-    status = _safe_status(status_query, validated_path)
+    status = None if action == ACTION_DISABLE_OPENRGB_SERVICE else _safe_status(status_query, validated_path)
     result = result_reader(not_before=started_at)
     return _finish_elevated_provisioning(action, exit_code, status, result)
 
@@ -2528,6 +2613,40 @@ def request_elevated_openrgb_provisioning(
 
     return run_elevated_provisioning(
         ACTION_PROVISION, validated, timeout_seconds=timeout_seconds
+    )
+
+
+def request_elevated_disable_openrgb_service(
+    openrgb_path, timeout_seconds=DISABLE_OPENRGB_SERVICE_HELPER_TIMEOUT_SECONDS
+):
+    """Stop + disable the fixed OpenRGB Windows service with one UAC approval.
+
+    This is the **only** entry point that may reach service mutation, and it is
+    reached only from an explicit user action on the Integrations page. Startup,
+    sleep, wake, status polling and solar reconciliation never call it.
+
+    When the process is already elevated the repair runs in-process; otherwise
+    a narrowly scoped elevated run of this same application is requested once
+    and waited for. Returns a :class:`ProvisionOutcome` and never raises.
+    """
+    import openrgb_service
+
+    try:
+        validated = validate_openrgb_executable(openrgb_path)
+    except WindowsTaskError as exc:
+        return ProvisionOutcome(False, str(exc))
+
+    if is_process_elevated():
+        result = openrgb_service.disable_openrgb_service(validated)
+        return ProvisionOutcome(result.ok, result.message, result.exit_code)
+
+    return run_elevated_provisioning(
+        ACTION_DISABLE_OPENRGB_SERVICE,
+        validated,
+        timeout_seconds=timeout_seconds,
+        # Service repair is verified by the helper's own re-query, not by the
+        # task-elevation status object.
+        status_query=lambda _path: None,
     )
 
 

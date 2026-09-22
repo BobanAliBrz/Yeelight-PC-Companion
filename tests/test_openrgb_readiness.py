@@ -1376,6 +1376,14 @@ class RestoreSequenceHarness:
     integration_path_available = (
         app.RestoreEngineThread.integration_path_available if app is not None else None
     )
+    # The real sequence reports a service-owned OpenRGB on the already-running
+    # path (a read-only diagnostic). The harness records it instead of talking
+    # to the real SCM.
+    _report_openrgb_service_owned_instance = (
+        app.RestoreEngineThread._report_openrgb_service_owned_instance
+        if app is not None
+        else None
+    )
     power_devices = app.RestoreEngineThread.power_devices if app is not None else None
 
     def __init__(self, config_manager, server, clock, is_dark=True, openrgb_running=False):
@@ -1424,6 +1432,9 @@ class RestoreSequenceHarness:
 
     def kill_process(self, name):
         self.killed.append(name)
+
+    def _report_openrgb_service_owned_instance(self):
+        self.service_reports = getattr(self, "service_reports", 0) + 1
 
     def is_process_running(self, name):
         if name == "OpenRGB.exe":

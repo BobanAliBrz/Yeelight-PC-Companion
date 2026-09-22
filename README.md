@@ -74,6 +74,10 @@ clock change heals itself.
   Artemis 2, each independently enabled and pointed at its executable.
 - **Seamless elevated OpenRGB launch** with a single one-time approval instead
   of a UAC prompt on every wake (see [Integrations](#integrations)).
+- **OpenRGB Windows-service conflict detection and one-click repair.** OpenRGB
+  1.0 can install a Windows service that fights YPC for OpenRGB's lifecycle.
+  YPC detects it automatically and can stop+disable that one service after you
+  approve (see [Troubleshooting](#troubleshooting)).
 - **System tray** operation with a dashboard window: Overview, Devices,
   Integrations, Automation and Logs.
 - **First-run wizard** — no JSON editing, no configuration file to create by
@@ -209,6 +213,33 @@ OpenRGB integration.
 The task is separate from the application itself. **Yeelight PC Companion runs as
 an ordinary, unelevated user process.**
 
+### OpenRGB Windows service conflict
+
+OpenRGB 1.0 can also install a **Windows service** named `OpenRGB` (the "OpenRGB
+SDK Server"). If that service is set to start automatically, Windows starts
+OpenRGB at boot and that service owns OpenRGB's lifecycle — which conflicts with
+Yeelight PC Companion managing OpenRGB itself across sleep/wake.
+
+When the OpenRGB integration is enabled, the Integrations page shows a separate
+**Windows service** row:
+
+| Status | Meaning |
+| --- | --- |
+| **No conflict** | No such service, or it is stopped and Disabled. |
+| **Installed, not conflicting** | Stopped and set to Manual; it will not start with Windows. |
+| **Conflict detected** | Running now, or set to start automatically. **Disable conflicting service** is offered. |
+| **Needs review** | The service points at a different executable than your configured OpenRGB path. YPC will not touch it. |
+| **Unknown** | The service could not be inspected. Review it manually. |
+
+**Disable conflicting service** (only enabled when the service really is the
+OpenRGB you configured) explains what it will do, asks once for administrator
+approval, stops the service, sets its startup type to Disabled, and verifies
+both facts. It then offers to run the normal Force System Sync so OpenRGB is
+relaunched through Yeelight PC Companion.
+
+Nothing is changed automatically. Startup, sleep and wake never elevate and
+never modify the service.
+
 ## Sleep and wake behaviour
 
 - The suspend sequence is deliberately fast: Windows freezes processes shortly
@@ -325,6 +356,22 @@ own `DETECTION_COMPLETE` event before starting Artemis, so very slow detection
 delays the restore rather than silently dropping controllers. The log names how
 many controllers detection produced and how long it took.
 
+**Some RGB stays rainbow after boot, or OpenRGB appears even though start-at-login
+is off.**
+OpenRGB 1.0 may have installed a Windows service named `OpenRGB` that starts it
+at boot. That fights Yeelight PC Companion for OpenRGB's lifecycle. Open the
+**Integrations** page: the **Windows service** row detects this automatically.
+Use **Disable conflicting service** (after the confirmation and one UAC prompt)
+to stop that service and set it to Disabled. You do not need to open
+`services.msc`. If the row says **Needs review**, the service points at a
+different executable than the OpenRGB path you configured — inspect it manually
+before changing anything.
+
+**RGB is wrong until I kill OpenRGB and press Force System Sync.**
+That is the service conflict above: a service-owned OpenRGB is started before
+hardware is ready and cannot be cleanly restarted by YPC. Disable the conflicting
+service from Integrations, then Force System Sync.
+
 **The log is not where I expect it.**
 See [Where your configuration lives](#where-your-configuration-lives). A portable
 build logs next to its executable, not in `%LOCALAPPDATA%`.
@@ -391,6 +438,7 @@ For a quick development build without the release pipeline, use
 | `yeelight_devices.py` | Yeelight device model, identity and LAN discovery. |
 | `yeelight_device_ui.py` | Device list, add/edit, discovery dialogs. |
 | `windows_tasks.py` | Windows scheduled-task elevation broker for OpenRGB. |
+| `openrgb_service.py` | OpenRGB Windows-service probe, identity check, conflict policy and the explicit stop+disable repair. |
 | `first_run_wizard.py` | The first-run setup wizard. |
 | `ui_theme.py`, `ui_components.py` | Presentation layer: palette, stylesheets and reusable widgets. |
 | `app_metadata.py` | **Single source of truth** for the product name and version. |

@@ -8,6 +8,52 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## [Unreleased]
 
+### Fixed — OpenRGB Windows service conflicts (v1.0.1 bugfix)
+
+OpenRGB 1.0 installations may include an **"OpenRGB" Windows service** (the
+"OpenRGB SDK Server"). When that service is set to **Automatic**, it starts
+OpenRGB at boot even with OpenRGB's own "Start at login" option off and with no
+startup entry present. That service then owns OpenRGB's lifecycle and hardware
+detection, which conflicts with Yeelight PC Companion's own launch/restore
+model: some RGB hardware comes up incorrectly, YPC's stale-process cleanup
+cannot reliably terminate the service-owned (often elevated) OpenRGB, and
+sleep/wake control becomes unreliable. The working manual fix is to stop the
+service and set it to Disabled.
+
+YPC now **detects** that configuration automatically whenever the OpenRGB
+integration is enabled:
+
+* read-only inspection of the fixed Windows service named `OpenRGB` through the
+  Service Control Manager (unelevated, minimum access rights),
+* a clear Integrations-page status row (`Windows service`) that distinguishes
+  absent, stopped+Disabled, stopped+Manual, running, Automatic, query failure
+  and binary-path mismatch,
+* one explicit **Disable conflicting service** action, enabled only when the
+  service binary path matches the OpenRGB executable configured in YPC,
+* a confirmation dialog explaining exactly what will happen, then a single UAC
+  prompt, then stop + set startup type to Disabled, then verification of both
+  facts,
+* after a successful repair, an offer to run the normal Force System Sync /
+  restore sequence (`trigger_resume()`) so OpenRGB is relaunched through YPC.
+
+**There is no automatic service mutation.** Detection is automatic; the
+service is only changed after explicit user approval. Startup, sleep, wake,
+status polling and solar reconciliation never elevate and never change the
+service. A binary-path mismatch is reported for manual review and is never
+stopped or disabled automatically.
+
+**The normal YPC scheduled-task launch/readiness architecture remains intact:**
+`YeelightPCCompanion-OpenRGB`, the protocol-6 `DETECTION_COMPLETE` readiness
+gate, Artemis ordering after OpenRGB readiness, and the ~1.5 s suspend budget
+are unchanged. When a conflicting service-owned OpenRGB is reused at restore
+time, YPC logs that it is using an externally managed instance instead of
+claiming full control.
+
+YPC does **not** restore/re-enable the OpenRGB Windows service when the
+integration is disabled, on exit, on sleep, or on uninstall. A service that was
+explicitly left disabled stays disabled; restoring another program's service is
+more dangerous than leaving a confirmed conflict disabled.
+
 ## [1.0.0] - 2026-09-21
 
 ### Added — release foundation and the Windows installation experience (Stage 7)

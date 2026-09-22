@@ -33,7 +33,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:  # pragma: no cover - environment dependent
     from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QPalette
-    from PyQt6.QtWidgets import QApplication, QDialog
+    from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 except Exception as exc:  # pragma: no cover - environment dependent
     QObject = None
     Qt = None
@@ -42,6 +42,7 @@ except Exception as exc:  # pragma: no cover - environment dependent
     QPalette = None
     QApplication = None
     QDialog = None
+    QMessageBox = None
     QT_IMPORT_ERROR = exc
 else:
     QT_IMPORT_ERROR = None
@@ -576,6 +577,153 @@ class TestIntegrationsPage(UiTestCase):
         window.select_page("Integrations")
         window._refresh_openrgb_elevation_status()
         self.assertTrue(self.elevation_queries)
+
+
+class TestOpenRgbServiceConflictUi(UiTestCase):
+    """The OpenRGB Windows-service conflict row on the Integrations page."""
+
+    EXPECTED = r"C:\Program Files\OpenRGB\OpenRGB.exe"
+
+    def probe(self, **overrides):
+        import openrgb_service as svc
+
+        defaults = {
+            "exists": True,
+            "state": "stopped",
+            "start_type": "manual",
+            "binary_path": self.EXPECTED,
+            "error": "",
+        }
+        defaults.update(overrides)
+        return svc.OpenRgbServiceProbe(**defaults)
+
+    def patch_probe(self, probe):
+        import openrgb_service as svc
+
+        self._patch(svc, "probe_openrgb_service", lambda: probe)
+        self._patch(app, "probe_openrgb_service", lambda: probe)
+
+    def test_the_service_row_is_separate_from_the_elevation_row(self):
+        window = self.window()
+        card = window.integration_cards["openrgb"]
+        self.assertIsNotNone(card.lbl_service_status)
+        self.assertIsNotNone(card.btn_service_action)
+        self.assertIsNotNone(card.lbl_service_hint)
+        self.assertIsNot(card.lbl_service_status, card.lbl_status)
+        self.assertIsNot(card.btn_service_action, card.btn_action)
+
+    def test_no_conflict_pill_and_disabled_button(self):
+        self.patch_probe(self.probe(state="stopped", start_type="disabled"))
+        window = self.window()
+        status = window._refresh_openrgb_service_status()
+        import openrgb_service as svc
+
+        self.assertEqual(status.state, svc.SERVICE_STATE_NO_CONFLICT)
+        self.assertEqual("No conflict", window.lbl_openrgb_service.text())
+        self.assertFalse(window.btn_openrgb_service.isEnabled())
+
+    def test_conflict_pill_and_enabled_button(self):
+        import openrgb_service as svc
+
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        status = window._refresh_openrgb_service_status()
+        self.assertEqual(status.state, svc.SERVICE_STATE_CONFLICT)
+        self.assertEqual("Conflict detected", window.lbl_openrgb_service.text())
+        self.assertTrue(window.btn_openrgb_service.isEnabled())
+        self.assertEqual(
+            svc.DISABLE_SERVICE_ACTION_LABEL, window.btn_openrgb_service.text()
+        )
+
+    def test_manual_idle_is_not_treated_as_disabled(self):
+        import openrgb_service as svc
+
+        self.patch_probe(self.probe(state="stopped", start_type="manual"))
+        window = self.window()
+        status = window._refresh_openrgb_service_status()
+        self.assertEqual(status.state, svc.SERVICE_STATE_INSTALLED_IDLE)
+        self.assertFalse(window.btn_openrgb_service.isEnabled())
+        self.assertIn("Manual", window.lbl_openrgb_service_hint.text())
+
+    def test_path_mismatch_disables_the_fix_button(self):
+        import openrgb_service as svc
+
+        self.patch_probe(
+            self.probe(
+                state="running", start_type="automatic", binary_path=r"C:\Other\App.exe"
+            )
+        )
+        window = self.window()
+        status = window._refresh_openrgb_service_status()
+        self.assertEqual(status.state, svc.SERVICE_STATE_BINARY_MISMATCH)
+        self.assertFalse(window.btn_openrgb_service.isEnabled())
+
+    def test_unknown_disables_the_fix_button(self):
+        import openrgb_service as svc
+
+        self.patch_probe(self.probe(exists=False, error="access denied"))
+        window = self.window()
+        status = window._refresh_openrgb_service_status()
+        self.assertEqual(status.state, svc.SERVICE_STATE_UNKNOWN)
+        self.assertFalse(window.btn_openrgb_service.isEnabled())
+
+    def test_explicit_confirmation_is_required_before_elevation(self):
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        asked = []
+
+        def decline(*_args, **_kwargs):
+            asked.append(True)
+            return QMessageBox.StandardButton.No
+
+        box = mock.Mock()
+        box.question = decline
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock()
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        window.repair_openrgb_service_conflict()
+        self.assertTrue(asked)
+        elevate.assert_not_called()
+
+    def test_failed_uac_is_nonfatal_and_reaches_warning(self):
+        import windows_tasks as wt
+
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        box = mock.Mock()
+        box.question = lambda *a, **k: QMessageBox.StandardButton.Yes
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock(
+            return_value=wt.ProvisionOutcome(
+                False, "Administrator approval was declined.", None
+            )
+        )
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        window.repair_openrgb_service_conflict()  # must not raise
+        self.assertTrue(box.warning.called)
+        elevate.assert_called_once()
+
+    def test_successful_repair_reaches_trigger_resume(self):
+        import windows_tasks as wt
+
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        box = mock.Mock()
+        box.question = lambda *a, **k: QMessageBox.StandardButton.Yes
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock(
+            return_value=wt.ProvisionOutcome(
+                True, "The OpenRGB Windows service is stopped and disabled.", 0
+            )
+        )
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        resumed = []
+        self._patch(window, "trigger_resume", lambda: resumed.append(True))
+        window.repair_openrgb_service_conflict()
+        self.assertEqual([True], resumed)
 
 
 class TestAutomationPage(UiTestCase):

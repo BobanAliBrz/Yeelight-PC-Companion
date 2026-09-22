@@ -227,7 +227,18 @@ class TestSuspendCallbackConfigurationRead(TempDirTestCase):
 
     @unittest.skipIf(app is None, SKIP_REASON)
     def test_the_connector_dies_before_the_fan_out_and_the_controllers_after_it(self):
-        """The suspend order is a contract: Connector, wait, fan-out, controllers."""
+        """The suspend order is a contract: Connector, wait, fan-out, controllers.
+
+        The task-aware OpenRGB stop is deliberately stubbed here: this test
+        pins the *relative order* of connector / release-wait / fan-out /
+        controller terminate. On a machine where an OpenRGB.exe process is
+        actually present (the real-world case that motivated the service
+        work), `end_openrgb_task()` legitimately polls inside its 0.4 s budget
+        and those verification sleeps are recorded by the shared `time.sleep`
+        patch. That behaviour is covered by `test_runtime_config`'s budget
+        tests and `test_startup_and_uninstall`'s deadline tests; it is not
+        what this ordering assertion is about.
+        """
         config = self.enabled_integration_config()
         manager = cm.ConfigManager(self.write_json(self.path(cm.CONFIG_FILENAME), config))
 
@@ -247,7 +258,9 @@ class TestSuspendCallbackConfigurationRead(TempDirTestCase):
 
         with mock.patch.object(app, "terminate_processes_win32", side_effect=record_terminate), mock.patch.object(
             app.time, "sleep", side_effect=record_sleep
-        ), mock.patch.object(app, "fire_and_forget_off_devices", side_effect=record_off):
+        ), mock.patch.object(app, "fire_and_forget_off_devices", side_effect=record_off), mock.patch.object(
+            app, "end_openrgb_task", return_value="not_running"
+        ):
             stub._execute_suspend_actions()
 
         self.assertEqual(["kill", "sleep", "off", "kill"], [event[0] for event in events])

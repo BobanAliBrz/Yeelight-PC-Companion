@@ -393,6 +393,136 @@ real, and Task Scheduler is the mechanism that stops it.
 disablement, no consent-policy change, no registry prompt suppression, no
 auto-elevated-binary abuse, and no new `runas` call anywhere in the sleep path.
 
+## 4c. OpenRGB Windows-service conflict (v1.0.1 bugfix)
+
+### Real-world reproduction
+
+OpenRGB 1.0 can install a Windows service:
+
+| Item | Value |
+| --- | --- |
+| Service name | `OpenRGB` |
+| Display name | `OpenRGB` |
+| Description | OpenRGB SDK Server |
+| Executable | `C:\Program Files\OpenRGB\OpenRGB.exe` |
+| Startup type | `Automatic` |
+
+Observed on real hardware: OpenRGB's own "Start at login" option is **off**,
+OpenRGB is absent from Task Manager Startup Apps, and no shortcut exists in
+`shell:startup`. Nevertheless, with YPC startup **disabled**, rebooting Windows
+still produces an `OpenRGB.exe` process. Expanding that process in Task Manager
+exposes the OpenRGB Windows service — the service is what starts OpenRGB at
+boot.
+
+Failure when the service is enabled:
+
+1. Windows boots; the OpenRGB service starts automatically.
+2. Some RGB hardware comes up incorrectly (motherboard/RAM can still be
+   controlled by Artemis; fans / motherboard-connected ARGB strip can remain
+   default rainbow).
+3. YPC's normal restore sees the existing OpenRGB process. Stale-process
+   cleanup cannot reliably terminate it (unelevated YPC vs. service-owned /
+   privileged OpenRGB).
+4. Run Sleep Actions removes YPC's task/tray OpenRGB, but `OpenRGB.exe` can
+   remain visible because the service stays alive.
+5. Killing the remaining OpenRGB process manually, then **Force System Sync**,
+   launches one clean YPC-controlled OpenRGB and **all RGB works**.
+
+**Confirmed manual fix:** stop the Windows service `OpenRGB`, set it from
+Automatic to **Disabled**, reboot. The problem disappears.
+
+**Important correction:** this is **not** primarily "YPC launches two OpenRGB
+instances". `RestoreEngineThread` kills stale OpenRGB, then checks whether
+`OpenRGB.exe` is still running before launching. A service-owned process can
+survive the unelevated kill; the restore then sees OpenRGB as already running
+and reuses it. The core incompatibility is:
+
+    OpenRGB Windows service owns lifecycle/hardware detection
+vs
+    Yeelight PC Companion expects to own OpenRGB lifecycle through
+    YeelightPCCompanion-OpenRGB.
+
+### Architecture chosen
+
+New module `openrgb_service.py` (standard library + ctypes only):
+
+| Piece | Role |
+| --- | --- |
+| `OpenRgbServiceProbe` | exists / state / start_type / binary_path / error |
+| `probe_openrgb_service()` | read-only SCM query, unelevated, handles always closed |
+| `extract_service_binary_path()` / `service_binary_matches()` | ImagePath parsing and executable-identity comparison |
+| `evaluate_openrgb_service_status()` | the pure conflict policy (UI + restore diagnostics) |
+| `disable_openrgb_service()` | the **only** mutation: stop + set startup Disabled + verify |
+
+`windows_tasks.py` gained one more narrow elevated CLI mode
+`--disable-openrgb-service <expected-openrgb-path>` (first argument only, no
+service-name parameter) and `request_elevated_disable_openrgb_service()`, which
+reuses the existing ShellExecuteEx + process-handle + result-channel model.
+
+UI: a separate **Windows service** row on the OpenRGB Integrations card
+(`with_service_status=True`), distinct from the elevated-launch row.
+
+Restore: on the already-running path only, a read-only diagnostic explains that
+an externally managed OpenRGB is being reused. The protocol-6 readiness gate is
+unchanged.
+
+### Security / elevation boundary
+
+* The service name is a hardcoded constant `OpenRGB`. No `--service-name`, no
+  generic command runner.
+* The expected OpenRGB path is used **only** to refuse a mismatched identity; it
+  is never executed.
+* Binary-identity mismatch or unverifiable identity → refuse mutation, no UAC
+  fix offered.
+* Read-only inspection works unelevated with `SC_MANAGER_CONNECT` +
+  `SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS`.
+* Mutation is reachable **only** from the explicit Integrations-page action
+  (`repair_openrgb_service_conflict`). Startup, sleep, wake, status polling and
+  solar reconciliation never call it.
+* Success is reported **only** when startup == Disabled **and** state ==
+  Stopped. Partial repair is a failure with its own diagnostic.
+* The suspend hot path and `END_TASK_STOP_BUDGET_SECONDS = 0.4 s` are unchanged.
+  The service-stop wait is a separate, longer, user-action budget.
+
+### Tests added
+
+`tests/test_openrgb_service.py` (mocked SCM, no real service, no elevation):
+read-only probe (absent/stopped/running/Automatic/Manual/Disabled/query error/
+handle closing), binary identity (quotes, case, spaces, arguments, mismatch,
+malformed, mismatch never reaches mutation), conflict policy (running⇒conflict
+even when Manual; Automatic⇒conflict when stopped; stopped+Manual is not an
+active conflict; stopped+Disabled is no conflict; unknown is never "safe"),
+privileged CLI (fixed command, missing/extra args, no service-name, no generic
+command interface, absent no-op, stop+disable, mismatch refuses, stop failure
+and disabled-but-running are not success, re-query/verify), elevation boundary
+(only explicit UI action; not startup/restore/suspend/status/solar), UI surface
+wiring, restore diagnostics (no second launch, service-conflict warning,
+readiness gate unchanged), suspend contract (budget unchanged, no service
+control in `_execute_suspend_actions`).
+
+Plus 9 window-level UI tests in `tests/test_ui.py`
+(`TestOpenRgbServiceConflictUi`) for pill/button state, confirmation, declined
+UAC and successful repair reaching `trigger_resume()`.
+
+**Existing test change (explained):** `test_openrgb_readiness.RestoreSequenceHarness`
+now implements `_report_openrgb_service_owned_instance`, because the real
+`RestoreEngineThread.run()` gained that read-only diagnostic on the
+already-running path. Without the stub, `run()` raised `AttributeError` and
+aborted before the readiness gate. `test_the_connector_dies_before_the_fan_out_and_the_controllers_after_it`
+now stubs `end_openrgb_task`: on a machine where `OpenRGB.exe` is actually
+running, the task-aware stop's verification polls and those sleeps are recorded
+by the shared `time.sleep` patch. That behaviour is covered by the dedicated
+budget/deadline tests; the ordering assertion is about connector/fan-out/controllers.
+
+### Not done on purpose (this patch)
+
+* No automatic service restore/re-enable on disable/exit/sleep/uninstall.
+* No config-schema bump and no persistent machine-state for the original start
+  type. A possible follow-up is to remember the original start type and offer an
+  explicit "Restore OpenRGB service" action.
+* No version bump to 1.0.1 yet (`app_metadata.py` stays at 1.0.0 under
+  [Unreleased]).
+
 ## 4b. OpenRGB elevation model — zero-UAC wake (critical design)
 
 OpenRGB needs administrator rights on some systems (RAM RGB and other kernel-driver devices). Launching it with `ShellExecuteW(..., "runas", ...)` works but shows a UAC prompt, and nobody is in front of the PC when it resumes. That is unacceptable for automatic sleep/wake restoration.

@@ -223,6 +223,7 @@ class IntegrationCard(SectionCard):
         description="",
         placeholder="",
         with_action=False,
+        with_service_status=False,
         parent=None,
     ):
         super().__init__(label, description, parent)
@@ -268,6 +269,30 @@ class IntegrationCard(SectionCard):
 
             self.lbl_hint = hint_label("")
             self.add_widget(self.lbl_hint)
+
+        # Optional second status area for the OpenRGB Windows-service conflict.
+        # Deliberately separate from the elevated-launch status above: the two
+        # describe different things (Task Scheduler launch vs. SCM service).
+        self.lbl_service_status = None
+        self.btn_service_action = None
+        self.lbl_service_hint = None
+        if with_service_status:
+            service_row = QHBoxLayout()
+            service_row.setSpacing(SPACE_S)
+            service_label = field_label("Windows service")
+            service_label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.lbl_service_status = StatusPill("Checking...", TONE_NEUTRAL)
+            self.btn_service_action = QPushButton("")
+            service_row.addWidget(service_label, 0)
+            service_row.addWidget(self.lbl_service_status, 0)
+            service_row.addStretch(1)
+            service_row.addWidget(self.btn_service_action, 0)
+            self.add_layout(service_row)
+
+            self.lbl_service_hint = hint_label("")
+            self.add_widget(self.lbl_service_hint)
 
     def set_enabled_state(self, enabled):
         self.chk_enabled.setChecked(bool(enabled))

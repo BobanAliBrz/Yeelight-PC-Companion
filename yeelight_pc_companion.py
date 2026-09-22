@@ -107,8 +107,24 @@ from windows_tasks import (
     openrgb_elevation_status,
     openrgb_process_running,
     openrgb_task_action,
+    request_elevated_disable_openrgb_service,
     run_openrgb_task,
     run_provisioning_cli,
+)
+
+# OpenRGB Windows-service conflict probe and policy. Read-only detection is
+# automatic; the only mutation is an explicit user action on Integrations.
+from openrgb_service import (
+    DISABLE_SERVICE_ACTION_LABEL,
+    SERVICE_STATE_BINARY_MISMATCH,
+    SERVICE_STATE_CONFLICT,
+    SERVICE_STATE_INSTALLED_IDLE,
+    SERVICE_STATE_NOT_USED,
+    SERVICE_STATE_NO_CONFLICT,
+    SERVICE_STATE_UNKNOWN,
+    evaluate_openrgb_service_status,
+    log_openrgb_service_conflict,
+    probe_openrgb_service,
 )
 
 # ---------------------------------------------------------
@@ -1665,7 +1681,14 @@ class RestoreEngineThread(QThread):
                                 self.progress_update.emit("Restoration sequence cancelled.")
                                 return
                 else:
+                    # Preserve the existing protection: a still-running OpenRGB
+                    # after stale cleanup is reused, never followed by a second
+                    # task-owned launch. Say *why* when the OpenRGB Windows
+                    # service is what keeps it alive - that is a lifecycle
+                    # ownership conflict, not evidence the readiness gate is
+                    # obsolete.
                     self.progress_update.emit("OpenRGB is already running.")
+                    self._report_openrgb_service_owned_instance()
                     self.progress_update.emit(
                         "Waiting for the running OpenRGB to confirm its controller list..."
                     )
@@ -1871,6 +1894,43 @@ class RestoreEngineThread(QThread):
                 env=external_process_environment(),
             )
         logging.info(f"Successfully spawned '{os.path.basename(path)}' with PID {proc.pid}")
+
+    def _report_openrgb_service_owned_instance(self):
+        """Explain a reused OpenRGB that the OpenRGB Windows service owns.
+
+        Read-only and never elevates. Called only on the already-running
+        restore path after stale cleanup, so the timing-critical suspend hot
+        path is untouched. Does not change control flow: the readiness gate
+        still runs exactly as before.
+
+        The note fires whenever the fixed service is actually active (running
+        now, or configured to start automatically) - identity matching is a
+        prerequisite for the *automated fix*, not for this honest warning.
+        """
+        try:
+            import openrgb_service
+
+            probe = openrgb_service.probe_openrgb_service()
+            if probe.is_absent or probe.query_failed:
+                return
+            service_active = (
+                probe.state in openrgb_service.NOT_STOPPED_STATES
+                or probe.start_type in openrgb_service.AUTOMATIC_START_TYPES
+            )
+            if not service_active:
+                return
+            message = (
+                "OpenRGB Windows service is active; using/reusing an externally "
+                "managed OpenRGB instance. Resolve the service conflict from "
+                "Integrations for reliable sleep/wake control."
+            )
+            self.progress_update.emit(message)
+            logging.warning("[RESTORE] %s", message)
+        except Exception:
+            # Diagnostics must never break the restore sequence.
+            logging.exception(
+                "[RESTORE] Could not inspect the OpenRGB Windows service."
+            )
 
     def wait_for_openrgb_ready(self, launched=False):
         """Hold the restore sequence until OpenRGB's detection is confirmed.
@@ -2426,6 +2486,9 @@ class YeelightPCCompanionWindow(QMainWindow):
         self._last_suspend_exec_time = 0.0
         self._sleep_transition_active = False
         self._system_sleeping = False
+        # Cached OpenRGB Windows-service classification (read-only). Mutation
+        # is never driven from this cache; the repair path re-probes first.
+        self._openrgb_service_status_obj = None
 
         # Watchdog timer — checks power detection health every 5 minutes
         self._watchdog_timer = QTimer(self)
@@ -2438,6 +2501,10 @@ class YeelightPCCompanionWindow(QMainWindow):
         # stay unattended, so a missing or stale launch task is surfaced in
         # Settings and in the log instead of raising a UAC prompt from the tray.
         self._log_openrgb_elevation_state()
+        # Detect (never mutate) a conflicting OpenRGB Windows service. One
+        # clear warning in the log plus the Integrations page indicator; no
+        # UAC and no repeating modal at every boot.
+        self._log_openrgb_service_state()
         
         # Trigger automatic restoration sequence on startup/boot
         if auto_restore and not self._automation_paused:
@@ -2521,6 +2588,7 @@ class YeelightPCCompanionWindow(QMainWindow):
         # refresh the reported OpenRGB elevation state (read-only inspection).
         self._populate_settings_widgets(self.config)
         self._refresh_openrgb_elevation_status()
+        self._refresh_openrgb_service_status()
         self._refresh_dashboard_labels()
         self.select_page(DEFAULT_PAGE)
         self.resize(1120, 720)
@@ -2796,6 +2864,7 @@ class YeelightPCCompanionWindow(QMainWindow):
                 INTEGRATION_DESCRIPTIONS.get(key, ""),
                 f"Path to {meta['hint']}",
                 with_action=(key == "openrgb"),
+                with_service_status=(key == "openrgb"),
             )
             card.btn_browse.clicked.connect(
                 lambda _checked=False, target=card.txt_path: self.browse_for_executable(target)
@@ -2807,6 +2876,12 @@ class YeelightPCCompanionWindow(QMainWindow):
                 self.btn_openrgb_elevation = card.btn_action
                 self.lbl_openrgb_elevation_hint = card.lbl_hint
                 self.btn_openrgb_elevation.clicked.connect(self.repair_openrgb_elevation)
+                # The OpenRGB Windows-service conflict is a separate concern
+                # from the elevated launch task and gets its own labelled row.
+                self.lbl_openrgb_service = card.lbl_service_status
+                self.btn_openrgb_service = card.btn_service_action
+                self.lbl_openrgb_service_hint = card.lbl_service_hint
+                self.btn_openrgb_service.clicked.connect(self.repair_openrgb_service_conflict)
             self.integration_cards[key] = card
             self.integration_widgets[key] = (card.chk_enabled, card.txt_path, card.btn_browse)
             layout.addWidget(card)
@@ -3010,6 +3085,180 @@ class YeelightPCCompanionWindow(QMainWindow):
             "[OPENRGB] OpenRGB seamless elevated launch is not ready (%s). OpenRGB is "
             "skipped after wake until it is set up on the Integrations page.",
             status.label,
+        )
+
+    # ---------------------------------------------------------
+    # OpenRGB Windows-service conflict (detect -> explain -> one-click fix)
+    # ---------------------------------------------------------
+    def _openrgb_service_status(self, probe=None):
+        """Read-only classification of the OpenRGB Windows service.
+
+        Detection is automatic and never elevates. The result is cached on the
+        window for restore diagnostics; the UI refresh always re-probes.
+        """
+        if probe is None:
+            probe = probe_openrgb_service()
+        enabled = integration_enabled(self.config, "openrgb")
+        expected = integration_path(self.config, "openrgb")
+        return evaluate_openrgb_service_status(probe, enabled, expected)
+
+    def _refresh_openrgb_service_status(self):
+        """Update the Integrations card's Windows-service row (read-only)."""
+        try:
+            status = self._openrgb_service_status()
+        except Exception:
+            logging.exception("[OPENRGB] Could not determine the Windows service status.")
+            self._openrgb_service_status_obj = None
+            self.lbl_openrgb_service.set_status("Unavailable", TONE_WARN)
+            self.lbl_openrgb_service_hint.setText(
+                "The OpenRGB Windows service could not be inspected. See the debug log for details."
+            )
+            self.btn_openrgb_service.setText(DISABLE_SERVICE_ACTION_LABEL)
+            self.btn_openrgb_service.setEnabled(False)
+            return None
+
+        self._openrgb_service_status_obj = status
+
+        if status.state in (SERVICE_STATE_NO_CONFLICT, SERVICE_STATE_NOT_USED):
+            tone = TONE_OK if status.state == SERVICE_STATE_NO_CONFLICT else TONE_NEUTRAL
+        elif status.state == SERVICE_STATE_INSTALLED_IDLE:
+            tone = TONE_NEUTRAL
+        elif status.state == SERVICE_STATE_CONFLICT:
+            tone = TONE_WARN
+        else:
+            # binary mismatch / unknown / review
+            tone = TONE_WARN
+
+        self.lbl_openrgb_service.set_status(status.label, tone)
+        self.btn_openrgb_service.setText(DISABLE_SERVICE_ACTION_LABEL)
+        # The button is enabled only when the identity is safely fixable.
+        self.btn_openrgb_service.setEnabled(status.can_auto_fix)
+        self.lbl_openrgb_service_hint.setText(status.detail or "")
+        return status
+
+    def _log_openrgb_service_state(self):
+        """Log exactly one warning when a real service conflict exists.
+
+        Detection at startup is automatic; mutation is not. No UAC is requested
+        and no modal dialog is raised for this.
+        """
+        try:
+            status = self._openrgb_service_status()
+        except Exception:
+            logging.exception("[OPENRGB] Could not inspect the Windows service at startup.")
+            return
+        self._openrgb_service_status_obj = status
+        log_openrgb_service_conflict(status)
+
+    def _confirm_openrgb_service_disable(self):
+        """Explain exactly what the one-click service repair will do."""
+        answer = QMessageBox.question(
+            self,
+            "Disable conflicting OpenRGB service",
+            "Yeelight PC Companion manages OpenRGB's SDK server and lifecycle "
+            "itself. OpenRGB's separate Windows service can start OpenRGB before "
+            "hardware is ready and prevents YPC from cleanly restarting it across "
+            "sleep/wake.\n\n"
+            "This will:\n"
+            "1. stop the Windows service named 'OpenRGB',\n"
+            "2. set its startup type to Disabled,\n"
+            "3. verify both facts afterwards.\n\n"
+            "Windows will show one permission prompt. The service is only "
+            "changed if it points at your configured OpenRGB executable.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def repair_openrgb_service_conflict(self):
+        """Explicit user action: stop + disable the conflicting OpenRGB service.
+
+        This is the **only** place that may reach service mutation / UAC for the
+        service. Startup, sleep, wake, status polling and solar reconciliation
+        never call it.
+        """
+        if self._sleep_transition_active or getattr(self, "_system_sleeping", False):
+            QMessageBox.information(
+                self,
+                "OpenRGB Windows service",
+                "A sleep transition is in progress. Try again after the PC is fully awake.",
+            )
+            return
+
+        try:
+            self._repair_openrgb_service_conflict()
+        except Exception:
+            logging.exception("[OPENRGB] Unexpected error while disabling the Windows service.")
+            QMessageBox.critical(
+                self,
+                "OpenRGB Windows service",
+                "An unexpected error occurred while disabling the OpenRGB Windows "
+                "service.\n\nSee the debug log for details.",
+            )
+        finally:
+            self._refresh_openrgb_service_status()
+
+    def _repair_openrgb_service_conflict(self):
+        if not integration_enabled(self.config, "openrgb"):
+            QMessageBox.information(
+                self,
+                "OpenRGB Windows service",
+                "Enable the OpenRGB integration first, save the settings, then "
+                "disable the conflicting service.",
+            )
+            return
+
+        openrgb_path = integration_path(self.config, "openrgb")
+        if not openrgb_path:
+            QMessageBox.warning(
+                self,
+                "OpenRGB Windows service",
+                "Set the OpenRGB executable path first, save the settings, then "
+                "disable the conflicting service.",
+            )
+            return
+
+        status = self._refresh_openrgb_service_status()
+        if status is not None and not status.can_auto_fix:
+            QMessageBox.warning(
+                self,
+                "OpenRGB Windows service",
+                status.detail
+                or "The OpenRGB Windows service cannot be disabled automatically.",
+            )
+            return
+
+        if not self._confirm_openrgb_service_disable():
+            return
+
+        ok, message = request_elevated_disable_openrgb_service(openrgb_path)
+        if ok:
+            self._refresh_openrgb_service_status()
+            # After a successful repair, offer the normal restore/sync path so
+            # OpenRGB is relaunched through YPC and the system reaches the
+            # correct state. Reuses trigger_resume(); no duplicate orchestration.
+            run_sync = QMessageBox.question(
+                self,
+                "OpenRGB Windows service",
+                f"{message}\n\n"
+                "Run Force System Sync now so OpenRGB is relaunched through "
+                "Yeelight PC Companion?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if (
+                run_sync == QMessageBox.StandardButton.Yes
+                and not self._sleep_transition_active
+                and not getattr(self, "_system_sleeping", False)
+            ):
+                self.trigger_resume()
+            return
+
+        QMessageBox.warning(
+            self,
+            "OpenRGB Windows service",
+            f"{message}\n\nYou can try again from the Integrations page at any time.",
         )
 
     def _confirm_openrgb_approval(self):
@@ -3425,6 +3674,7 @@ class YeelightPCCompanionWindow(QMainWindow):
         # removed. The wake path itself never requests elevation.
         self._sync_openrgb_elevation_task(previous_openrgb)
         self._refresh_openrgb_elevation_status()
+        self._refresh_openrgb_service_status()
 
         logging.info("Applied changes to Solar Thread and IP Engine.")
         for warning in result.warnings:
@@ -3495,6 +3745,7 @@ class YeelightPCCompanionWindow(QMainWindow):
         # Importing never requests elevation; it only reports the new task state
         # so the user can repair it from Settings.
         self._refresh_openrgb_elevation_status()
+        self._refresh_openrgb_service_status()
 
         logging.info("Configuration imported successfully (%s).", os.path.basename(path))
         QMessageBox.information(
