@@ -72,12 +72,28 @@ function Invoke-Checked {
     }
 }
 
+<#
+Join a child path only when the base environment path is present.
+
+Join-Path itself throws when its -Path argument is null or empty, which is
+exactly what happens when ProgramFiles / ProgramFiles(x86) are unset. Building
+tool-lookup candidates must never depend on those variables being set.
+#>
+function Join-PathIfBase {
+    param(
+        [string]$BasePath,
+        [Parameter(Mandatory)][string]$ChildPath
+    )
+    if ([string]::IsNullOrWhiteSpace($BasePath)) { return $null }
+    return Join-Path $BasePath $ChildPath
+}
+
 function Get-IsccPath {
     $candidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    )
+        (Join-PathIfBase $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-PathIfBase ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-PathIfBase $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    ) | Where-Object { $_ }
     foreach ($candidate in $candidates) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
     }
@@ -118,6 +134,48 @@ function Invoke-SilentInstaller {
     $process = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" `
         -ArgumentList $commandLine -PassThru -Wait
     return $process.ExitCode
+}
+
+<#
+Run 7-Zip extract as an expected-to-fail probe. Never terminates the build.
+
+Inno Setup 6.7 installers are often not readable by 7-Zip. That failure is
+expected and is exactly why the test-install fallback exists. Under the
+script-wide $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns
+native stderr into a NativeCommandError and aborts before the fallback runs.
+This helper isolates that one probe: the native call is non-terminating, the
+exit code is returned, and the previous preference state is restored in
+finally so later steps still fail normally.
+#>
+function Invoke-SevenZipExtractProbe {
+    param(
+        [Parameter(Mandatory)][string]$SevenZipPath,
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$OutputDir
+    )
+
+    $previousEap = $ErrorActionPreference
+    $previousNative = $null
+    $hadNativePref = $false
+    try {
+        $ErrorActionPreference = 'Continue'
+        # PowerShell 7.3+ can promote native stderr to ErrorRecord when this
+        # preference is on. Guarded so the script still runs on Windows
+        # PowerShell 5.1, where the variable does not exist.
+        if (Test-Path -LiteralPath 'variable:PSNativeCommandUseErrorActionPreference') {
+            $hadNativePref = $true
+            $previousNative = Get-Variable -Name 'PSNativeCommandUseErrorActionPreference' -ValueOnly
+            Set-Variable -Name 'PSNativeCommandUseErrorActionPreference' -Value $false
+        }
+        & $SevenZipPath x $ArchivePath "-o$OutputDir" -y *> $null
+        return [int]$LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+        if ($hadNativePref) {
+            Set-Variable -Name 'PSNativeCommandUseErrorActionPreference' -Value $previousNative
+        }
+    }
 }
 
 Push-Location $RepoRoot
@@ -266,19 +324,24 @@ try {
         New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 
         $SevenZip = @(
-            (Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
-            (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe')
+            (Join-PathIfBase $env:ProgramFiles '7-Zip\7z.exe'),
+            (Join-PathIfBase ${env:ProgramFiles(x86)} '7-Zip\7z.exe')
         ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 
         $Extracted = $false
         if ($SevenZip) {
-            # This is expected to fail against Inno Setup 6.7 ("Cannot open the
-            # file as archive"), which is exactly why the fallback below exists.
-            # It is not an error, so it is not wrapped in Invoke-Checked.
-            & $SevenZip x $SetupExe "-o$StageDir" -y *> $null
+            # Expected to fail against Inno Setup 6.7 ("Cannot open the file as
+            # archive"). That is not a build error; the test-install fallback
+            # below exists for exactly this case. Isolated so native stderr
+            # cannot terminate the script (see Invoke-SevenZipExtractProbe).
+            $sevenZipExit = Invoke-SevenZipExtractProbe `
+                -SevenZipPath $SevenZip -ArchivePath $SetupExe -OutputDir $StageDir
             if (Test-Path -LiteralPath (Join-Path $StageDir "$AppName.exe")) {
                 $Extracted = $true
                 Write-Host 'Installer payload extracted for inspection.'
+            }
+            else {
+                Write-Host "7-Zip could not extract this installer format (exit $sevenZipExit); using test-install fallback."
             }
         }
 

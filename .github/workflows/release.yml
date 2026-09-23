@@ -54,12 +54,19 @@ jobs:
 
       - name: Locate Inno Setup compiler
         run: |
-          $candidates = @(
-            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-          )
-          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          # Join-Path throws when its base path is null/empty, so only build a
+          # candidate when the environment variable is actually present.
+          $candidates = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+          }
+          if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+            $candidates += (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+            $candidates += (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          }
+          $iscc = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
           if (-not $iscc) { throw 'ISCC.exe was not found after installing Inno Setup.' }
           $iscc | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           Write-Host "ISCC: $iscc"
