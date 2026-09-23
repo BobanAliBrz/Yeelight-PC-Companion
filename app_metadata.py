@@ -37,16 +37,17 @@ APP_URL = "https://github.com/BobanAliBrz/Yeelight-PC-Companion"
 # Version
 # ---------------------------------------------------------
 # Semantic version: (major, minor, patch). This is the only place the released
-# version is written down. v1.0.0 is the first public release.
-VERSION = (1, 0, 0)
+# version is written down. v1.0.0 is the first public release; v1.0.1 is the
+# OpenRGB Windows-service conflict bugfix.
+VERSION = (1, 0, 1)
 
-#: ``"1.0.0"`` — the human-facing version.
+#: ``"1.0.1"`` — the human-facing version.
 APP_VERSION = ".".join(str(part) for part in VERSION)
 
-#: ``(1, 0, 0, 0)`` — the fixed-point version Windows file metadata requires.
+#: ``(1, 0, 1, 0)`` — the fixed-point version Windows file metadata requires.
 VERSION_QUAD = VERSION + (0,)
 
-#: ``"1.0.0.0"`` — dotted form of :data:`VERSION_QUAD`.
+#: ``"1.0.1.0"`` — dotted form of :data:`VERSION_QUAD`.
 APP_VERSION_QUAD = ".".join(str(part) for part in VERSION_QUAD)
 
 

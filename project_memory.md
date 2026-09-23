@@ -15,8 +15,8 @@
 - **Former internal name:** **Lumina** (with the `Slon Inc` metadata vendor). The source module, packaging, startup scripts, Windows metadata, AppUserModelID, scheduled task, log file, window/tray text, and icon filename have been renamed to the Yeelight PC Companion naming as part of the *Rename & Packaging Foundation* change.
 - **Rename status:** complete for all active source/build/runtime branding. `Lumina` only survives where it is deliberately historical or migration-related (changelog history, the historical note above, the `.gitignore` legacy-log compatibility rule, and the legacy scheduled-task removal in `register_startup.bat`).
 - **License:** **GPL-3.0-only** (`LICENSE`), chosen because PyQt6 is itself `GPL-3.0-only` under its open-source terms. Direct dependencies are all compatible (§11).
-- **Version source of truth:** `app_metadata.py` (`VERSION = (1, 0, 0)`). Since Stage 7 nothing else may hard-code a version: `version_info.txt` and `installer/version.iss` are *generated* from it (§10b).
-- **Current release:** `v1.0.0`, the first public GitHub release.
+- **Version source of truth:** `app_metadata.py` (`VERSION = (1, 0, 1)`). Since Stage 7 nothing else may hard-code a version: `version_info.txt` and `installer/version.iss` are *generated* from it (§10b).
+- **Current release:** `v1.0.1`, the OpenRGB Windows-service conflict bugfix over the first public release `v1.0.0`.
 
 ## 1b. Release foundation (Stage 7)
 
@@ -520,8 +520,8 @@ budget/deadline tests; the ordering assertion is about connector/fan-out/control
 * No config-schema bump and no persistent machine-state for the original start
   type. A possible follow-up is to remember the original start type and offer an
   explicit "Restore OpenRGB service" action.
-* No version bump to 1.0.1 yet (`app_metadata.py` stays at 1.0.0 under
-  [Unreleased]).
+* The feature patch itself kept `app_metadata.py` at 1.0.0; the v1.0.1
+  release-prep commit bumps the version and moves this material under [1.0.1].
 
 ## 4b. OpenRGB elevation model — zero-UAC wake (critical design)
 
@@ -1115,7 +1115,7 @@ boot.
 
 ## 10b. Version source of truth
 
-`app_metadata.py` holds `VERSION = (1, 0, 0)` and the product identity strings.
+`app_metadata.py` holds `VERSION = (1, 0, 1)` and the product identity strings.
 Everything else is derived:
 
 | Artifact | How it gets the version |
@@ -1362,7 +1362,7 @@ whose own licences ship inside `_internal/*.dist-info/licenses/`.
 - `register_startup.bat` — **legacy/development migration helper only**; needs no administrator rights, removes the retired elevated logon tasks and writes the current per-user `HKCU` Run entry. It never touches `YeelightPCCompanion-OpenRGB`.
 - `installer/YeelightPCCompanion.iss` — the Inno Setup 6 installer (§10c).
 - `tools/release_privacy_scan.py` — artifact privacy enforcement (§13a).
-- `version_info.txt` — Windows executable metadata; product/description `Yeelight PC Companion`, internal/original names `YeelightPCCompanion`, company `Yeelight PC Companion Contributors`, version `1.0.0`.
+- `version_info.txt` — Windows executable metadata; product/description `Yeelight PC Companion`, internal/original names `YeelightPCCompanion`, company `Yeelight PC Companion Contributors`, version `1.0.1`.
 - `yeelight_pc_companion.ico` — binary icon asset (renamed from `lumina.ico`; artwork not redesigned).
 
 ### Repository/process documentation

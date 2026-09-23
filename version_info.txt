@@ -1,13 +1,13 @@
 # UTF-8
 #
 # GENERATED FILE - do not edit by hand.
-# Source of truth: app_metadata.py (VERSION = (1, 0, 0))
+# Source of truth: app_metadata.py (VERSION = (1, 0, 1))
 # Regenerate with: python tools/write_version_info.py
 #
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 0, 1, 0),
+    prodvers=(1, 0, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -22,12 +22,12 @@ VSVersionInfo(
         [
           StringStruct("CompanyName", "Yeelight PC Companion Contributors"),
           StringStruct("FileDescription", "Yeelight PC Companion"),
-          StringStruct("FileVersion", "1.0.0"),
+          StringStruct("FileVersion", "1.0.1"),
           StringStruct("InternalName", "YeelightPCCompanion"),
           StringStruct("LegalCopyright", "Copyright (C) 2026 Yeelight PC Companion Contributors"),
           StringStruct("OriginalFilename", "YeelightPCCompanion.exe"),
           StringStruct("ProductName", "Yeelight PC Companion"),
-          StringStruct("ProductVersion", "1.0.0")
+          StringStruct("ProductVersion", "1.0.1")
         ]
       )
     ]),

@@ -8,6 +8,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-23
+
 ### Fixed — OpenRGB Windows service conflicts (v1.0.1 bugfix)
 
 OpenRGB 1.0 installations may include an **"OpenRGB" Windows service** (the

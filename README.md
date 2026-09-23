@@ -9,7 +9,8 @@ progressively generalised. It is a local-only tool: it talks to your lights on
 your own network and to OpenRGB/Artemis on `localhost`. It has no account, no
 telemetry and no cloud component.
 
-> **Release status.** **v1.0.0** is the first public release. The Windows
+> **Release status.** **v1.0.1** is the current release (OpenRGB Windows-service
+> conflict bugfix). **v1.0.0** was the first public release. The Windows
 > installer and executables are **not code-signed**, so SmartScreen/reputation
 > warnings may appear (see [Code signing](#code-signing)).
 
@@ -453,7 +454,7 @@ For a quick development build without the release pipeline, use
 The version is defined **once**, in `app_metadata.py`:
 
 ```python
-VERSION = (1, 0, 0)
+VERSION = (1, 0, 1)
 ```
 
 Everything else is derived from it:
