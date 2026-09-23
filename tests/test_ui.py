@@ -725,6 +725,75 @@ class TestOpenRgbServiceConflictUi(UiTestCase):
         window.repair_openrgb_service_conflict()
         self.assertEqual([True], resumed)
 
+    def test_unreadable_service_status_never_reaches_uac(self):
+        """Finding 3: status None must fail closed before confirmation/UAC."""
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        self._patch(window, "_refresh_openrgb_service_status", lambda: None)
+        box = mock.Mock()
+        box.question = mock.Mock(side_effect=AssertionError("confirmation must not be reached"))
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock(
+            side_effect=AssertionError("elevation must not be requested")
+        )
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        window.repair_openrgb_service_conflict()  # must not raise
+        elevate.assert_not_called()
+        box.question.assert_not_called()
+        self.assertTrue(box.warning.called)
+
+    def test_active_restore_refuses_service_repair_before_uac(self):
+        """Finding 4: an in-progress restore must block service repair/UAC."""
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        window.restore_thread = mock.Mock()
+        window.restore_thread.isRunning.return_value = True
+        box = mock.Mock()
+        box.question = mock.Mock(side_effect=AssertionError("confirmation must not be reached"))
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock(
+            side_effect=AssertionError("elevation must not be requested")
+        )
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        mutate = mock.Mock(
+            side_effect=AssertionError("service mutation must not run")
+        )
+        import openrgb_service as svc
+
+        self._patch(svc, "disable_openrgb_service", mutate)
+        window.repair_openrgb_service_conflict()  # must not raise
+        elevate.assert_not_called()
+        box.question.assert_not_called()
+        mutate.assert_not_called()
+        self.assertTrue(box.information.called)
+        # Read-only refresh still runs in the outer finally.
+        self.assertIsNotNone(window._openrgb_service_status_obj)
+
+    def test_repair_with_no_active_restore_still_reaches_trigger_resume(self):
+        """Finding 4 control: idle restore keeps the existing success path."""
+        import windows_tasks as wt
+
+        self.patch_probe(self.probe(state="running", start_type="automatic"))
+        window = self.window()
+        window.restore_thread = None
+        box = mock.Mock()
+        box.question = lambda *a, **k: QMessageBox.StandardButton.Yes
+        box.StandardButton = QMessageBox.StandardButton
+        self._patch(app, "QMessageBox", box)
+        elevate = mock.Mock(
+            return_value=wt.ProvisionOutcome(
+                True, "The OpenRGB Windows service is stopped and disabled.", 0
+            )
+        )
+        self._patch(app, "request_elevated_disable_openrgb_service", elevate)
+        resumed = []
+        self._patch(window, "trigger_resume", lambda: resumed.append(True))
+        window.repair_openrgb_service_conflict()
+        elevate.assert_called_once()
+        self.assertEqual([True], resumed)
+
 
 class TestAutomationPage(UiTestCase):
     """The split automation form keeps every field and its mapping."""

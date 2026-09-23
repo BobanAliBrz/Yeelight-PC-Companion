@@ -478,6 +478,65 @@ class TestConflictPolicy(unittest.TestCase):
         status = self.evaluate(state="start_pending", start_type="manual")
         self.assertTrue(status.is_conflict)
 
+    def test_partial_status_failure_with_disabled_config_is_unknown_not_safe(self):
+        # exists=True, QueryServiceStatus failed, QueryServiceConfig succeeded
+        # with Disabled + a matching binary. Fail closed: never "No conflict".
+        status = self.evaluate(
+            exists=True,
+            state="unknown",
+            start_type="disabled",
+            binary_path=self.EXPECTED,
+            error="status unreadable",
+        )
+        self.assertEqual(status.state, svc.SERVICE_STATE_UNKNOWN)
+        self.assertNotEqual(status.state, svc.SERVICE_STATE_NO_CONFLICT)
+        self.assertFalse(status.can_auto_fix)
+        self.assertIn("status unreadable", status.detail)
+
+    def test_partial_status_failure_with_automatic_config_is_unknown_no_fix(self):
+        status = self.evaluate(
+            exists=True,
+            state="unknown",
+            start_type="automatic",
+            binary_path=self.EXPECTED,
+            error="status unreadable",
+        )
+        self.assertEqual(status.state, svc.SERVICE_STATE_UNKNOWN)
+        self.assertFalse(status.can_auto_fix)
+        self.assertNotEqual(status.state, svc.SERVICE_STATE_NO_CONFLICT)
+
+    def test_partial_config_failure_is_unknown_or_review_no_fix(self):
+        # exists=True, status read succeeded (running), config query failed so
+        # identity/start type are unverifiable.
+        status = self.evaluate(
+            exists=True,
+            state="running",
+            start_type="unknown",
+            binary_path="",
+            error="config unreadable",
+        )
+        self.assertIn(
+            status.state,
+            (svc.SERVICE_STATE_UNKNOWN, svc.SERVICE_STATE_BINARY_MISMATCH),
+        )
+        self.assertFalse(status.can_auto_fix)
+        self.assertNotEqual(status.state, svc.SERVICE_STATE_NO_CONFLICT)
+
+    def test_error_present_never_produces_no_conflict(self):
+        cases = [
+            dict(exists=False, state="unknown", start_type="unknown", binary_path="", error="x"),
+            dict(exists=True, state="unknown", start_type="disabled", binary_path=self.EXPECTED, error="x"),
+            dict(exists=True, state="stopped", start_type="manual", binary_path=self.EXPECTED, error="x"),
+            dict(exists=True, state="stopped", start_type="disabled", binary_path=self.EXPECTED, error="x"),
+            dict(exists=True, state="running", start_type="automatic", binary_path=self.EXPECTED, error="x"),
+            dict(exists=True, state="stopped", start_type="unknown", binary_path="", error="x"),
+        ]
+        for overrides in cases:
+            with self.subTest(**overrides):
+                status = self.evaluate(**overrides)
+                self.assertNotEqual(status.state, svc.SERVICE_STATE_NO_CONFLICT)
+                self.assertFalse(status.can_auto_fix)
+
     def test_policy_is_pure_and_takes_no_service_name(self):
         # The evaluator must not accept a service name parameter.
         parameters = inspect.signature(svc.evaluate_openrgb_service_status).parameters
@@ -779,6 +838,52 @@ class TestDisableMutationInternals(unittest.TestCase):
         # (STOP/CHANGE_CONFIG) must never have been requested.
         for access in opened:
             self.assertEqual(access & (svc.SERVICE_STOP | svc.SERVICE_CHANGE_CONFIG), 0)
+
+    def test_wait_saying_stopped_cannot_override_a_running_final_query(self):
+        """The FINAL re-query is authoritative.
+
+        A wait helper that reports stopped must not turn a contradictory final
+        RUNNING (or START_PENDING) result into success.
+        """
+        for final_state in (svc.SERVICE_RUNNING, svc.SERVICE_START_PENDING):
+            with self.subTest(final_state=final_state):
+                fake = ScmFake(
+                    state=svc.SERVICE_RUNNING,
+                    start_type=svc.SERVICE_AUTO_START,
+                    binary_path=self.EXPECTED,
+                )
+
+                def change(advapi32, service_handle, fake=fake):
+                    fake.change_config_calls.append(service_handle)
+                    fake.start_type = "disabled"
+
+                def request_stop(advapi32, service_handle, fake=fake):
+                    fake.control_calls.append(service_handle)
+                    return True
+
+                def wait_stopped(advapi32, service_handle, timeout_seconds, fake=fake, fs=final_state):
+                    # Wait claims success...
+                    return True
+                    # ...but the service is NOT actually stopped. Leave state as-is.
+
+                def query_status(advapi32, service_handle, fake=fake, fs=final_state):
+                    # Final re-query contradicts the wait.
+                    return types.SimpleNamespace(dwCurrentState=fs)
+
+                def query_config(advapi32, service_handle, fake=fake):
+                    return "disabled", fake.binary_path
+
+                fake.change_startup_disabled = change
+                fake.request_stop = request_stop
+                fake.wait_stopped = wait_stopped
+                fake.query_status = query_status
+                fake.query_config = query_config
+                install_scm_fake(self, fake)
+
+                result = svc.disable_openrgb_service(self.EXPECTED)
+                self.assertFalse(result.ok, "wait=True must not override a non-stopped final state")
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertNotIn("stopped and disabled", result.message)
 
 
 # ---------------------------------------------------------

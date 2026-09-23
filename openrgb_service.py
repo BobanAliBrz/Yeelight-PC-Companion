@@ -546,8 +546,12 @@ def evaluate_openrgb_service_status(probe, integration_enabled, expected_path):
     boot conflict and is reported as installed/idle rather than as disabled.
     A running service is a current conflict even when its start type is Manual.
 
-    A query failure is unknown - never "safe". A binary-path mismatch is a
-    review state: the automated fix is not offered.
+    A query failure is unknown - never "safe". This includes a *partial*
+    failure where the service was proven to exist but only one of the later
+    queries (status or config) failed: any non-empty ``probe.error`` blocks
+    the safe/no-conflict and installed-idle classifications and blocks the
+    automated fix. A binary-path mismatch is a review state: the automated fix
+    is not offered.
     """
     if not integration_enabled:
         return OpenRgbServiceStatus(
@@ -559,12 +563,21 @@ def evaluate_openrgb_service_status(probe, integration_enabled, expected_path):
             probe=probe,
         )
 
-    if probe is None or (probe.query_failed and not probe.exists):
-        detail = (
-            probe.error
-            if probe is not None and probe.error
-            else "The OpenRGB Windows service could not be inspected."
-        )
+    # Fail closed on ANY inspection failure - including a partial one where
+    # exists=True and only the status or the config query failed. "Unknown"
+    # is never treated as safe, and an error never reaches No conflict or
+    # Installed idle.
+    if probe is None or probe.query_failed:
+        if probe is not None and probe.error:
+            if probe.exists:
+                detail = (
+                    "The OpenRGB Windows service exists but could not be fully "
+                    f"inspected ({probe.error})"
+                )
+            else:
+                detail = probe.error
+        else:
+            detail = "The OpenRGB Windows service could not be inspected."
         return OpenRgbServiceStatus(
             SERVICE_STATE_UNKNOWN,
             "Unknown",
@@ -880,7 +893,10 @@ def disable_openrgb_service(
             except OpenRgbServiceError as exc:
                 stop_error = str(exc)
 
-        # Re-query. Success requires Disabled AND Stopped - nothing less.
+        # Re-query. Success requires the FINAL re-query to prove Disabled AND
+        # Stopped - nothing less. The earlier wait observation is useful
+        # process information but must never override a contradictory final
+        # state (e.g. wait returned True while the service is RUNNING again).
         final_state = STATE_UNKNOWN
         final_start = START_TYPE_UNKNOWN
         verify_error = ""
@@ -893,7 +909,7 @@ def disable_openrgb_service(
             verify_error = str(exc)
 
         startup_ok = final_start == "disabled"
-        state_ok = final_state == "stopped" or stopped
+        state_ok = final_state == "stopped"
 
         if startup_ok and state_ok and not verify_error:
             return OpenRgbServiceDisableResult(
@@ -903,11 +919,15 @@ def disable_openrgb_service(
             )
 
         if startup_ok and not state_ok:
+            note = ""
+            if stopped and final_state != "stopped":
+                note = " The stop wait reported stopped, but the final state disagrees."
             return OpenRgbServiceDisableResult(
                 False,
                 (
                     "The OpenRGB service startup type is now Disabled, but the "
                     f"service did not stop (state={final_state})."
+                    + note
                     + (f" {stop_error}" if stop_error else "")
                 ),
                 5,

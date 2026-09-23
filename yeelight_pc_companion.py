@@ -3186,6 +3186,20 @@ class YeelightPCCompanionWindow(QMainWindow):
             )
             return
 
+        # Stopping the service also stops the OpenRGB process an in-progress
+        # restore is using. Refuse before confirmation/UAC so the active
+        # readiness/restore sequence is not invalidated mid-flight; after it
+        # finishes, repair + Force System Sync starts a fresh restore instead
+        # of being discarded as a duplicate.
+        if self.restore_thread and self.restore_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "OpenRGB Windows service",
+                "System restoration is currently running. Wait for it to finish, "
+                "then disable the conflicting OpenRGB service.",
+            )
+            return
+
         try:
             self._repair_openrgb_service_conflict()
         except Exception:
@@ -3220,7 +3234,17 @@ class YeelightPCCompanionWindow(QMainWindow):
             return
 
         status = self._refresh_openrgb_service_status()
-        if status is not None and not status.can_auto_fix:
+        # Fail closed before UAC: an unreadable/unknown service state must not
+        # reach confirmation or the elevated helper at all.
+        if status is None:
+            QMessageBox.warning(
+                self,
+                "OpenRGB Windows service",
+                "The OpenRGB Windows service could not be inspected, so it will "
+                "not be changed. Review the service manually and try again.",
+            )
+            return
+        if not status.can_auto_fix:
             QMessageBox.warning(
                 self,
                 "OpenRGB Windows service",
