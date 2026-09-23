@@ -851,11 +851,20 @@ def disable_openrgb_service(
         except OpenRgbServiceError as exc:
             return OpenRgbServiceDisableResult(False, str(exc), 1)
 
-        # Mutation needs STOP + CHANGE_CONFIG + QUERY_STATUS. Nothing else.
+        # Minimum rights for this handle's whole lifetime:
+        #   SERVICE_CHANGE_CONFIG - set startup type to Disabled
+        #   SERVICE_STOP          - request a stop
+        #   SERVICE_QUERY_STATUS  - wait for / re-query the final state
+        #   SERVICE_QUERY_CONFIG  - re-query the startup type (QueryServiceConfigW
+        #                           on this same handle during final verification)
+        # Nothing broader; never SERVICE_ALL_ACCESS.
         service_handle, error_code = _open_service(
             advapi32,
             scm_handle,
-            SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_CHANGE_CONFIG,
+            SERVICE_QUERY_CONFIG
+            | SERVICE_QUERY_STATUS
+            | SERVICE_STOP
+            | SERVICE_CHANGE_CONFIG,
         )
         if not service_handle:
             if error_code == ERROR_SERVICE_DOES_NOT_EXIST:

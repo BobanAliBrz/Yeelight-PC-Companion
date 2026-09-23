@@ -119,6 +119,14 @@ class ScmFake:
     def query_config(self, advapi32, service_handle):
         if self.config_error:
             raise svc.OpenRgbServiceError(self.config_error)
+        # QueryServiceConfigW needs SERVICE_QUERY_CONFIG on the handle. Enforce
+        # it so a mutation open that forgets that right fails the way real
+        # Windows would (Access Denied) instead of silently succeeding.
+        if not (self.last_desired_access & svc.SERVICE_QUERY_CONFIG):
+            raise svc.OpenRgbServiceError(
+                "QueryServiceConfigW requires SERVICE_QUERY_CONFIG "
+                f"(granted mask={self.last_desired_access:#x})."
+            )
         # Mirror the real helper: return the *name*, not the raw DWORD.
         if isinstance(self.start_type, str):
             name = self.start_type
@@ -838,6 +846,92 @@ class TestDisableMutationInternals(unittest.TestCase):
         # (STOP/CHANGE_CONFIG) must never have been requested.
         for access in opened:
             self.assertEqual(access & (svc.SERVICE_STOP | svc.SERVICE_CHANGE_CONFIG), 0)
+
+    def test_mutation_handle_requests_exactly_the_rights_it_needs(self):
+        """The mutation handle must include SERVICE_QUERY_CONFIG.
+
+        Final verification calls QueryServiceConfigW on the *same* handle to
+        re-read the startup type. Without SERVICE_QUERY_CONFIG a real Windows
+        repair can stop+disable the service and then fail verification with
+        Access Denied. The mask is otherwise exactly the four rights this
+        handle uses - never SERVICE_ALL_ACCESS or unrelated service rights.
+        """
+        expected_mask = (
+            svc.SERVICE_QUERY_CONFIG
+            | svc.SERVICE_QUERY_STATUS
+            | svc.SERVICE_STOP
+            | svc.SERVICE_CHANGE_CONFIG
+        )
+        fake = ScmFake(
+            state=svc.SERVICE_STOPPED,
+            start_type=svc.SERVICE_DEMAND_START,
+            binary_path=self.EXPECTED,
+        )
+
+        def change(advapi32, service_handle):
+            fake.change_config_calls.append(service_handle)
+            fake.start_type = "disabled"
+
+        fake.change_startup_disabled = change
+        opened = []
+        original_open = fake.open_service
+
+        def tracking_open(advapi32, scm_handle, desired_access):
+            opened.append(desired_access)
+            return original_open(advapi32, scm_handle, desired_access)
+
+        fake.open_service = tracking_open
+        install_scm_fake(self, fake)
+
+        result = svc.disable_openrgb_service(self.EXPECTED)
+        self.assertTrue(result.ok)
+
+        mutation_opens = [
+            access for access in opened if access & svc.SERVICE_CHANGE_CONFIG
+        ]
+        self.assertEqual(
+            len(mutation_opens),
+            1,
+            f"expected exactly one mutation open, got {opened!r}",
+        )
+        self.assertEqual(
+            mutation_opens[0],
+            expected_mask,
+            "mutation mask must be QUERY_CONFIG|QUERY_STATUS|STOP|CHANGE_CONFIG "
+            f"(got {mutation_opens[0]:#x}, want {expected_mask:#x})",
+        )
+        # All four required rights are present.
+        for right in (
+            svc.SERVICE_QUERY_CONFIG,
+            svc.SERVICE_QUERY_STATUS,
+            svc.SERVICE_STOP,
+            svc.SERVICE_CHANGE_CONFIG,
+        ):
+            self.assertEqual(
+                mutation_opens[0] & right,
+                right,
+                f"missing required right {right:#x}",
+            )
+        # And nothing broader than those four (this also rejects ALL_ACCESS).
+        self.assertEqual(mutation_opens[0] & ~expected_mask, 0)
+
+    def test_final_verification_uses_query_config_on_the_mutation_handle(self):
+        """ScmFake enforces SERVICE_QUERY_CONFIG; a full repair must succeed."""
+        fake = ScmFake(
+            state=svc.SERVICE_STOPPED,
+            start_type=svc.SERVICE_DEMAND_START,
+            binary_path=self.EXPECTED,
+        )
+
+        def change(advapi32, service_handle):
+            fake.change_config_calls.append(service_handle)
+            fake.start_type = "disabled"
+
+        fake.change_startup_disabled = change
+        install_scm_fake(self, fake)
+        result = svc.disable_openrgb_service(self.EXPECTED)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.exit_code, 0)
 
     def test_wait_saying_stopped_cannot_override_a_running_final_query(self):
         """The FINAL re-query is authoritative.
