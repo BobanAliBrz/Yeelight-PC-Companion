@@ -15,8 +15,8 @@
 - **Former internal name:** **Lumina** (with the `Slon Inc` metadata vendor). The source module, packaging, startup scripts, Windows metadata, AppUserModelID, scheduled task, log file, window/tray text, and icon filename have been renamed to the Yeelight PC Companion naming as part of the *Rename & Packaging Foundation* change.
 - **Rename status:** complete for all active source/build/runtime branding. `Lumina` only survives where it is deliberately historical or migration-related (changelog history, the historical note above, the `.gitignore` legacy-log compatibility rule, and the legacy scheduled-task removal in `register_startup.bat`).
 - **License:** **GPL-3.0-only** (`LICENSE`), chosen because PyQt6 is itself `GPL-3.0-only` under its open-source terms. Direct dependencies are all compatible (§11).
-- **Version source of truth:** `app_metadata.py` (`VERSION = (1, 0, 1)`). Since Stage 7 nothing else may hard-code a version: `version_info.txt` and `installer/version.iss` are *generated* from it (§10b).
-- **Current release:** `v1.0.1`, the OpenRGB Windows-service conflict bugfix over the first public release `v1.0.0`.
+- **Version source of truth:** `app_metadata.py` (`VERSION = (1, 0, 2)`). Since Stage 7 nothing else may hard-code a version: `version_info.txt` and `installer/version.iss` are *generated* from it (§10b).
+- **Current release:** `v1.0.2`, the automatic Yeelight power checks and recovery update, following the OpenRGB service conflict fix in `v1.0.1`.
 
 ## 1b. Release foundation (Stage 7)
 
@@ -136,6 +136,76 @@ Important current behavior:
 - At night, reconciliation can trigger a restore/self-heal when the Yeelight Connector is missing.
 - Nighttime self-heal is throttled to at most once every 15 minutes.
 - During daytime, reconciliation kills the connector and turns the enabled Yeelight devices off if the connector is unexpectedly running.
+
+### Yeelight power health checks (2026-10-25)
+
+The Connector process alone does not prove a bulb is on, and Connector-based
+reconciliation does nothing when that integration is disabled. A separate
+`YeelightHealthCheckThread` now checks every enabled configured bulb, independently
+of the integration flags, while awake and with `restore_apps_on_wake` enabled.
+
+- `yeelight_health.py` owns `DeviceHealth`, the read-only probe, a two-second
+  per-bulb deadline, the 30-minute periodic interval and the 30-second settling
+  interval. The probe uses the pinned Yeelight library's `send_discovery_packet`
+  and `parse_capabilities` helpers for **unicast UDP status requests to configured
+  addresses on port 1982**. It never runs a LAN-wide discovery, changes power,
+  stops music mode or opens a command TCP connection. Sockets are always closed;
+  unrelated datagrams cannot extend the deadline or supply a bulb's state, and
+  a reported device ID that disagrees with its saved Yeelight ID is not trusted.
+- One owned single-shot `_yeelight_health_timer` schedules the next 30-minute
+  check; the initial solar update, day/night transitions and restore completion
+  schedule a check after 30 seconds instead. Status polling, the existing
+  five-minute power watchdog and this timer are the window's three owned timers.
+- A **confirmed OFF reply** at night calls `trigger_resume(automatic=True)`, the
+  existing Force System Sync restore sequence. The recovery checks the current
+  configuration and freshly recalculates the solar state before acting. The
+  solar thread, restore thread and health recovery share
+  `calculate_solar_dark_state()`; the original sunrise/sunset buffer rule is
+  unchanged. Health-triggered syncs have a monotonic 30-minute cooldown and set
+  the existing Connector-heal timestamp too. A post-restore check still runs
+  during that cooldown so failures are visible without forming a restore loop.
+- Silence is **Not responding**, never OFF. Timeouts, absent mains power and
+  network failures only produce a warning on Overview and Devices. Incomplete
+  replies are **Unknown** and never cause recovery. An unavailable bulb cannot
+  prevent another bulb from being checked or recovered. Healthy checks produce
+  no recurring log messages, popups or tray notifications.
+- The UI displays a check time plus device names, addresses and reported states.
+  Those results are memory-only and are discarded when configuration changes.
+  No setting/schema change is needed. Disabled devices are never queried, and
+  `--no-automation` suppresses the check entirely.
+- Probes run off the GUI thread. Sleep requests interruption without waiting;
+  a generation token rejects results from before a restore or solar change, and
+  sleeping/restoring/exiting guards reject late callbacks. Automatic resumes
+  never clear sleep flags. Suspend also cancels an already-constructed restore
+  even if its QThread has not started yet. Exit requests probe interruption and
+  allows at most the probe deadline plus one second for it to finish.
+- `tests/test_yeelight_health.py` covers confirmed state, silence, malformed and
+  unrelated replies, identity mismatch, deadlines/socket cleanup, timer/worker
+  wiring, per-bulb failure isolation, cancellation, disabled devices, Connector-
+  independent recovery, cooldown, warning clearance, changed configuration,
+  sunrise, and sleep arriving during recovery setup. Real checks on both saved
+  bulbs returned **ON** during development; no physical power changes or actual
+  sleep/reboot were used for verification.
+- Packaged startup verification also found a build-environment trap: PyInstaller
+  collected an unrelated `icuuc.dll` from PATH. Its versioned ICU exports do not
+  satisfy Qt's Windows ICU imports, so QtCore failed before application logging
+  started. The spec now excludes only that unversioned DLL and relies on the
+  Windows-provided API. A console diagnostic reproduced the error and confirmed
+  the dependency mismatch; the corrected normal build is smoke-tested against
+  an isolated profile with automation suppressed before preparing the installer.
+- The shared UI and runtime-configuration test fixtures also mock the OpenRGB
+  task-stop boundary and its process verification. Those older fixtures had
+  mocked native termination but left Task Scheduler reachable, so suspend tests
+  could stop the maintainer's real OpenRGB task. The fixture-level mock prevents
+  that side effect; tests of task stopping still override it with their own fakes.
+- Release preparation (2026-10-26): version metadata, README and changelog are
+  updated for `v1.0.2`. Release artifacts are the versioned Windows installer,
+  portable ZIP and `SHA256SUMS.txt`; publication is an explicit GitHub Release,
+  separate from the tag-triggered build-only workflow. Local installer verification
+  uses the compiled payload and isolated startup checks rather than the pipeline's
+  test-install/uninstall fallback, which would touch the real installation's
+  startup registration and OpenRGB task. The full pipeline can still run in CI's
+  disposable Windows environment.
 
 ### `RestoreEngineThread`
 
@@ -1310,6 +1380,8 @@ whose own licences ship inside `_internal/*.dist-info/licenses/`.
 
 ### Core
 
+- `yeelight_health.py` - read-only configured-bulb power checks, immutable status
+  results, per-probe deadline and health timer constants (see above).
 - `yeelight_pc_companion.py` — main application implementation; power handling, orchestration, tray, the window/page UI, settings/import/export, logging, and entry point. Configuration is accessed through `ConfigManager` (no direct JSON writes remain). Every Yeelight operation iterates the enabled device list from `config_manager.enabled_device_ips()`; the suspend path sends its OFF commands through the globally bounded batch sender `fire_and_forget_off_devices()` (§5, §8c). Since Stage 5 the window is built from the shared presentation layer below; only presentation moved out of this module.
 - `ui_theme.py` — **presentation layer: visual system**: palette (graphite/navy surfaces, one muted indigo accent, semantic green/amber/red), typography (Segoe UI / Cascadia Mono, no bundled fonts), the 8/12/16/24 px spacing rhythm and radii, the application stylesheet (`APP_QSS`) plus the wizard (`WIZARD_QSS`) and dialog (`DIALOG_QSS`) variants, `dark_palette()`/`apply_app_theme()` (sets Fusion + palette so a dark theme needs no image assets and stays DPI-correct) and the semantic tone helpers (`pill_qss`, `text_qss`) that keep status text and colour together. No configuration, power, process or network logic.
 - `ui_components.py` — **presentation layer: reusable widgets**: `SectionCard`, `StatusPill`, `StatusRow`, `SidebarButton`, `IntegrationCard`, the label helpers and the transparent `scrollable()`/`page_body()` page scaffold. Layout and rendering only; callers keep their own data flow.
@@ -1340,6 +1412,9 @@ whose own licences ship inside `_internal/*.dist-info/licenses/`.
 
 ### Tests
 
+- `tests/test_yeelight_health.py` - read-only power protocol handling and the
+  real periodic Qt worker/recovery/UI flow, with probes and restores mocked.
+  With this feature the full suite passes **847 tests** (2026-10-25).
 - `tests/test_config_manager.py` — `unittest` suite for the pure configuration logic (defaults, migration, validation, `v0 → v1 → v2`, integration inference, save/load round trip, atomic-write/backup behaviour, import/export, storage-location rules, legacy discovery, the runtime loader boundary, malformed-section rejection, and file-vs-directory executable checks). No GUI and no Windows power behaviour is faked.
 - `tests/test_device_discovery.py` — `unittest` suite for the device model (§8c): identity generation and stability, list operations (add/edit/remove, duplicate ids and addresses, summary), the v2 device schema and its validation (any device count, malformed entries, optional metadata, import/export, malformed-import-changes-nothing), the runtime projection, the whole `v1 → v2` migration matrix (no address, each slot, both, duplicate address, v0 all the way through, persistence + backup, runtime loader, import), discovery normalization (multiple devices, duplicates, missing fields, `Location` fallback, unusable responses), matching and applying (new / already added / IP changed / id adoption / selected names / duplicate-address refusal), every discovery failure path (zero results, network error, missing library, bounded timeout), the discovery worker thread, the **discovery guard** (a reported result / zero results / a network error close promptly, a guard timeout returns the timeout report without waiting for the worker again, no synchronous `wait()` and no `terminate()`, an abandoned worker stays alive and referenced until its own `finished` releases it, a late result cannot reach the UI or a later discovery, and the guard is derived from the same clamped timeout as the search), the wizard's device page, and the shipped example template. `yeelight.discover_bulbs` is mocked — the suite never broadcasts on the real network; the guard tests run against an offscreen `QApplication` with a fake progress dialog and a search the test controls.
 - `tests/test_runtime_config.py` — `unittest` suite for the runtime configuration boundary of `yeelight_pc_companion` (the suspend callback performs no filesystem probing and never runs discovery, it iterates every enabled device, no devices still completes, a failed reload keeps the last known-good config, an executable path that is a directory is not usable, and the **suspend OFF fan-out** is bounded: one global budget for 1/2/20 unreachable devices, one `select()` wait, IPv4/IPv6 addressed by literal without DNS or `getaddrinfo`, no `yeelight.Bulb`, reachable devices still switch off when a peer is dead or refuses, zero devices returns immediately, every socket is closed on every path, disabled devices are excluded, the Connector still dies before the fan-out and OpenRGB/Artemis after it with the 0.35 s release wait kept). It drives the real window/thread methods through minimal stub objects: no window is created and no power event is triggered. The fan-out tests substitute a fake socket layer and a fake clock, so the timing assertions never sleep for real. `TestSuspendSequenceStaysInsideItsBudget` then pins the whole-sequence contract: the budgeted phases (`suspend_budgeted_seconds()`) must stay **strictly below** `SUSPEND_SEQUENCE_TARGET_SECONDS`, the task stop must be under a third of the target, and the **real** `_execute_suspend_actions()` with OpenRGB enabled runs against a fake clock and a faked clock-controlled task stop — proving the sequence's only waits are the Connector release plus the task stop's own verification interval, that every later step (controller terminate, completion log) is still reached, and that a hung `schtasks`, a missing task and an accepted-but-ineffective `/end` can no longer stretch the sequence. A regression test asserts the suspend callback performs **no filesystem probes and no task-existence query**. It is skipped only if `yeelight_pc_companion` cannot be imported at all.
@@ -1362,7 +1437,7 @@ whose own licences ship inside `_internal/*.dist-info/licenses/`.
 - `register_startup.bat` — **legacy/development migration helper only**; needs no administrator rights, removes the retired elevated logon tasks and writes the current per-user `HKCU` Run entry. It never touches `YeelightPCCompanion-OpenRGB`.
 - `installer/YeelightPCCompanion.iss` — the Inno Setup 6 installer (§10c).
 - `tools/release_privacy_scan.py` — artifact privacy enforcement (§13a).
-- `version_info.txt` — Windows executable metadata; product/description `Yeelight PC Companion`, internal/original names `YeelightPCCompanion`, company `Yeelight PC Companion Contributors`, version `1.0.1`.
+- `version_info.txt` — Windows executable metadata; product/description `Yeelight PC Companion`, internal/original names `YeelightPCCompanion`, company `Yeelight PC Companion Contributors`, version `1.0.2`.
 - `yeelight_pc_companion.ico` — binary icon asset (renamed from `lumina.ico`; artwork not redesigned).
 
 ### Repository/process documentation

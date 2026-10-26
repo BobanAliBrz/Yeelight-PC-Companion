@@ -137,6 +137,8 @@ class UiTestCase(unittest.TestCase):
             app, "openrgb_elevation_status", self.recorded_elevation_status
         )
         self._patch(app, "get_running_processes_win32", lambda: set())
+        self._patch(app, "end_openrgb_task", mock.Mock(return_value=wt.END_TASK_ABSENT))
+        self._patch(app, "openrgb_process_running", mock.Mock(return_value=False))
         # Nothing in this module may broadcast on the real LAN. A test that
         # wants to prove the Discover wiring replaces this with its own recorder.
         self._patch(
@@ -226,13 +228,17 @@ class UiTestCase(unittest.TestCase):
 
     def dispose(self, window):
         """Stop the real timers/threads so a test never leaves work behind."""
-        for name in ("status_timer", "_watchdog_timer"):
+        for name in ("status_timer", "_watchdog_timer", "_yeelight_health_timer"):
             timer = getattr(window, name, None)
             if timer is not None:
                 timer.stop()
         thread = getattr(window, "solar_thread", None)
         if thread is not None:
             thread.stop()
+        health_worker = getattr(window, "_yeelight_health_thread", None)
+        if health_worker is not None:
+            health_worker.requestInterruption()
+            health_worker.wait(3000)
         tray = getattr(window, "tray_icon", None)
         if tray is not None:
             tray.hide()
@@ -1128,9 +1134,9 @@ class TestStatusPollingCadence(UiTestCase):
         timers = find_children(window, lambda widget: isinstance(widget, QTimer))
         self.assertIn(window.status_timer, timers)
         self.assertEqual(
-            2,
+            3,
             len(timers),
-            "only the process-status and watchdog timers may exist",
+            "only the process-status, watchdog and bulb-health timers may exist",
         )
         self.assertTrue(window.status_timer.isActive())
 

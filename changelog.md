@@ -8,6 +8,27 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-26
+
+### Added
+
+- A silent Yeelight power check every 30 minutes while the PC is awake, with
+  another check 30 seconds after startup/wake restoration or a day/night change.
+  A responding bulb that reports OFF during nighttime triggers the same Force
+  System Sync sequence as the manual button, even without the Chroma Connector.
+- Overview and Devices now show each enabled bulb's last reported power state
+  and flag bulbs that are not responding, with a reminder to check power or the
+  network. An unanswered query never triggers a sync by itself. Automatic bulb
+  recovery is limited to once per 30 minutes, with a follow-up after restoration.
+
+### Fixed
+
+- Background bulb checks are cancelled during sleep and restoration. Stale
+  results cannot start a sync after sleep, a configuration change or sunrise,
+  and a restore caught between construction and startup is cancelled by sleep.
+- Windows builds no longer bundle an unrelated `icuuc.dll` found on the build
+  machine's PATH, which could prevent Qt from loading before startup.
+
 ## [1.0.1] - 2026-09-23
 
 ### Fixed — OpenRGB Windows service conflicts (v1.0.1 bugfix)

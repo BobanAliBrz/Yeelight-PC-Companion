@@ -9,8 +9,8 @@ progressively generalised. It is a local-only tool: it talks to your lights on
 your own network and to OpenRGB/Artemis on `localhost`. It has no account, no
 telemetry and no cloud component.
 
-> **Release status.** **v1.0.1** is the current release (OpenRGB Windows-service
-> conflict bugfix). **v1.0.0** was the first public release. The Windows
+> **Release status.** **v1.0.2** is the current release (automatic Yeelight power
+> checks and recovery). **v1.0.0** was the first public release. The Windows
 > installer and executables are **not code-signed**, so SmartScreen/reputation
 > warnings may appear (see [Code signing](#code-signing)).
 
@@ -71,6 +71,9 @@ clock change heals itself.
   with a friendly name, an address and its own enable switch. One unreachable
   device never blocks the others.
 - **LAN device discovery**, or add a device by hand.
+- **Automatic power checks** every 30 minutes while awake. A bulb that reports
+  OFF at night triggers Force System Sync. Bulbs that do not respond are flagged
+  on Overview and Devices without repeatedly restarting the lighting software.
 - **Integrations** for OpenRGB, Yeelight Chroma Connector, Razer Synapse 3 and
   Artemis 2, each independently enabled and pointed at its executable.
 - **Seamless elevated OpenRGB launch** with a single one-time approval instead
@@ -262,6 +265,16 @@ never modify the service.
 - The **Run Sleep Actions** button in the Overview page runs the sleep sequence
   without actually suspending Windows, which is useful for testing.
 
+While awake, the app checks enabled bulbs' reported power every 30 minutes and
+30 seconds after restoration or a day/night change. A bulb that replies OFF
+during nighttime triggers **Force System Sync**, at most once per 30 minutes.
+This works with the Chroma Connector disabled too. Overview and Devices show
+the check time and each bulb's status. **Not responding** means to check power,
+LAN Control or the network; it never triggers a sync on its own. These checks
+use read-only unicast status requests to saved addresses and leave music mode
+alone. They pause during sleep/restoration and when automatic restoration is
+disabled.
+
 ## Device discovery
 
 Discovery is **user-triggered only** (the **Discover** button on the Devices
@@ -283,8 +296,9 @@ configuration.
 - Device addresses, names and integration paths stay in your local configuration
   file.
 - The only network traffic is:
-  - **LAN**: commands to your Yeelight devices on port `55443`, and SSDP
-    discovery when you explicitly ask for it;
+  - **LAN**: commands to your Yeelight devices on port `55443`, automatic
+    unicast power-status queries to saved addresses on UDP port `1982`, and
+    LAN-wide SSDP discovery only when you explicitly ask for it;
   - **localhost**: Artemis' JSON module API on `127.0.0.1:9696`, and the OpenRGB
     SDK server on `127.0.0.1:6742`.
 - The release artifacts are scanned by an automated privacy check

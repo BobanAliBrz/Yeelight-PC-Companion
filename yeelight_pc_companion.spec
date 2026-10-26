@@ -7,6 +7,8 @@
 # config.example.json template may be bundled. A build must be able to
 # succeed on a clean checkout that has no personal configuration present.
 
+import os
+
 a = Analysis(
     ["yeelight_pc_companion.py"],
     pathex=[],
@@ -28,6 +30,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Qt uses the ICU API supplied by Windows. A different ICU DLL found on PATH
+# (for example a document tool's build) has incompatible, versioned exports and
+# prevents QtCore from loading. Let Windows provide its own unversioned DLL.
+a.binaries = [
+    binary for binary in a.binaries
+    if os.path.basename(binary[0]).lower() != "icuuc.dll"
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(

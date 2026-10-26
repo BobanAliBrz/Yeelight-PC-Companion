@@ -96,6 +96,14 @@ def restore_stub():
 class TempDirTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="yeelight-runtime-test-")
+        if app is not None:
+            for name, value in (
+                ("_run_schtasks", (1, "", "The system cannot find the file specified.")),
+                ("_openrgb_process_ids", []),
+            ):
+                patcher = mock.patch.object(wt, name, return_value=value)
+                patcher.start()
+                self.addCleanup(patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)

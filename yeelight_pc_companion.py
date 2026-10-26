@@ -71,6 +71,7 @@ from config_manager import (
     ConfigValidationError,
     configured_devices,
     device_count_summary,
+    enabled_configured_devices,
     enabled_device_ips,
     get_app_dir,
     integration_enabled,
@@ -84,6 +85,15 @@ from first_run_wizard import run_first_run_wizard
 # LAN discovery, both shared with the first-run wizard. Discovery runs in its
 # own worker thread and is never started automatically.
 from yeelight_device_ui import DeviceListWidget
+from yeelight_health import (
+    HEALTH_CHECK_INTERVAL_MS,
+    HEALTH_CHECK_SETTLE_MS,
+    HEALTH_PROBE_TIMEOUT_SECONDS,
+    NOT_RESPONDING,
+    UNKNOWN,
+    DeviceHealth,
+    probe_device_power,
+)
 
 # Windows Scheduled Task elevation broker for OpenRGB. OpenRGB needs
 # administrator rights on some systems; the dedicated scheduled task lets wake
@@ -348,6 +358,26 @@ class QtLogHandler(logging.Handler, QObject):
 # ---------------------------------------------------------
 # State and Solar Calculation Engine (Background Thread)
 # ---------------------------------------------------------
+def calculate_solar_dark_state(config):
+    import ephem
+
+    location = config["location"]
+    obs = ephem.Observer()
+    obs.lat = str(location["latitude"])
+    obs.lon = str(location["longitude"])
+    obs.elevation = float(location["elevation"])
+    obs.date = datetime.now(timezone.utc)
+    now = obs.date.datetime()
+    next_sunrise = obs.next_rising(ephem.Sun()).datetime()
+    next_sunset = obs.next_setting(ephem.Sun()).datetime()
+    buffer_delta = timedelta(hours=float(location["light_buffer_hours"]))
+
+    if next_sunrise < next_sunset:
+        return True
+    prev_sunrise = obs.previous_rising(ephem.Sun()).datetime()
+    return (next_sunset - now <= buffer_delta) or (now - prev_sunrise <= buffer_delta)
+
+
 class SolarEngineThread(QThread):
     solar_update = pyqtSignal(bool, str) # (is_dark, status_text)
     api_error = pyqtSignal(str)
@@ -366,34 +396,7 @@ class SolarEngineThread(QThread):
                 # truth for defaults/validation/migration).
                 config = self.config_manager.load()
 
-                lat = config["location"]["latitude"]
-                lon = config["location"]["longitude"]
-                elev = config["location"]["elevation"]
-                buffer_hours = config["location"]["light_buffer_hours"]
-                
-                import ephem
-                obs = ephem.Observer()
-                obs.lat = str(lat)
-                obs.lon = str(lon)
-                obs.elevation = float(elev)
-                
-                # ephem dates are UTC based
-                obs.date = datetime.now(timezone.utc)
-                now = obs.date.datetime()
-                
-                next_sunrise = obs.next_rising(ephem.Sun()).datetime()
-                next_sunset = obs.next_setting(ephem.Sun()).datetime()
-                
-                buffer_delta = timedelta(hours=float(buffer_hours))
-                
-                # Check dark state
-                if next_sunrise < next_sunset:
-                    is_dark = True
-                else:
-                    prev_sunrise = obs.previous_rising(ephem.Sun()).datetime()
-                    time_to_sunset = next_sunset - now
-                    time_since_sunrise = now - prev_sunrise
-                    is_dark = (time_to_sunset <= buffer_delta) or (time_since_sunrise <= buffer_delta)
+                is_dark = calculate_solar_dark_state(config)
                 
                 status_text = "Nighttime" if is_dark else "Daytime"
 
@@ -1595,8 +1598,33 @@ def wait_for_openrgb_ready(
 
 
 # ---------------------------------------------------------
-# Launch / Restore Sequencer (Background Thread)
+# Background bulb checks and launch / restore sequencing
 # ---------------------------------------------------------
+class YeelightHealthCheckThread(QThread):
+    results_ready = pyqtSignal(int, object, object)
+
+    def __init__(self, generation, config):
+        super().__init__()
+        self.generation = generation
+        self.config = copy.deepcopy(config)
+
+    def run(self):
+        results = []
+        for device in enabled_configured_devices(self.config):
+            if self.isInterruptionRequested():
+                return
+            try:
+                result = probe_device_power(device)
+            except Exception:
+                logging.warning("[YEELIGHT HEALTH] A configured bulb's power check failed.")
+                result = DeviceHealth(
+                    device["id"], device["name"], device["ip"], UNKNOWN, "Power check failed"
+                )
+            results.append(result)
+        if not self.isInterruptionRequested():
+            self.results_ready.emit(self.generation, self.config, results)
+
+
 class RestoreEngineThread(QThread):
     progress_update = pyqtSignal(str)
     finished_sequence = pyqtSignal()
@@ -2029,23 +2057,7 @@ class RestoreEngineThread(QThread):
 
     def evaluate_solar_state(self, config):
         try:
-            import ephem
-            obs = ephem.Observer()
-            obs.lat = str(config["location"]["latitude"])
-            obs.lon = str(config["location"]["longitude"])
-            obs.elevation = float(config["location"]["elevation"])
-            obs.date = datetime.now(timezone.utc)
-            now = obs.date.datetime()
-            next_sunrise = obs.next_rising(ephem.Sun()).datetime()
-            next_sunset = obs.next_setting(ephem.Sun()).datetime()
-            buffer_delta = timedelta(hours=float(config["location"]["light_buffer_hours"]))
-            
-            if next_sunrise < next_sunset:
-                return True
-            prev_sunrise = obs.previous_rising(ephem.Sun()).datetime()
-            time_to_sunset = next_sunset - now
-            time_since_sunrise = now - prev_sunrise
-            return (time_to_sunset <= buffer_delta) or (time_since_sunrise <= buffer_delta)
+            return calculate_solar_dark_state(config)
         except Exception as e:
             logging.error(f"Failed to evaluate solar state in sequencer: {e}")
             return False
@@ -2438,6 +2450,14 @@ class YeelightPCCompanionWindow(QMainWindow):
         self.config_manager = config_manager or ConfigManager(config_path)
         self.config_path = self.config_manager.config_path
         self._automation_paused = automation_paused
+        self._last_solar_is_dark = None
+        self._yeelight_health_thread = None
+        self._yeelight_health_generation = 0
+        self._yeelight_health_results = []
+        self._yeelight_health_config = None
+        self._yeelight_health_checked_at = None
+        self._last_yeelight_recovery_at = None
+        self._exiting = False
         # The Stage 5 redesign: a restrained dark utility window instead of the
         # earlier glassmorphic dashboard. The theme is application-wide so every
         # dialog, message box and the first-run wizard match.
@@ -2494,6 +2514,11 @@ class YeelightPCCompanionWindow(QMainWindow):
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.timeout.connect(self._watchdog_check)
         self._watchdog_timer.start(300000)  # 5 minutes
+
+        self._yeelight_health_timer = QTimer(self)
+        self._yeelight_health_timer.setSingleShot(True)
+        self._yeelight_health_timer.timeout.connect(self._start_yeelight_health_check)
+        self._yeelight_health_timer.start(HEALTH_CHECK_INTERVAL_MS)
 
         logging.info("Yeelight PC Companion initialized. System running silently in tray.")
 
@@ -2751,6 +2776,16 @@ class YeelightPCCompanionWindow(QMainWindow):
         coordinates.addStretch(1)
         facts.addLayout(coordinates, 1, 1)
 
+        facts.addWidget(field_label("Bulb health"), 2, 0)
+        self.lbl_yeelight_health = QLabel("Not checked yet")
+        self.lbl_yeelight_health.setWordWrap(True)
+        self.lbl_yeelight_health.setTextFormat(Qt.TextFormat.PlainText)
+        facts.addWidget(self.lbl_yeelight_health, 2, 1)
+        self.lbl_yeelight_health_details = QLabel("")
+        self.lbl_yeelight_health_details.setWordWrap(True)
+        self.lbl_yeelight_health_details.setTextFormat(Qt.TextFormat.PlainText)
+        facts.addWidget(self.lbl_yeelight_health_details, 3, 0, 1, 2)
+
         card_env.add_layout(facts)
 
         # --- service health ---------------------------------------------
@@ -2830,6 +2865,10 @@ class YeelightPCCompanionWindow(QMainWindow):
         self.btn_discover.clicked.connect(self.device_list.on_discover)
         self.btn_add_device.clicked.connect(self.device_list.on_add_manually)
         card.add_widget(self.device_list)
+        self.lbl_yeelight_device_health = QLabel("Not checked yet")
+        self.lbl_yeelight_device_health.setWordWrap(True)
+        self.lbl_yeelight_device_health.setTextFormat(Qt.TextFormat.PlainText)
+        card.add_widget(self.lbl_yeelight_device_health)
         card.add_hint(
             "Disable a device to leave it alone, or remove it to stop controlling it entirely. "
             "Enabling or disabling takes effect when you save."
@@ -3502,8 +3541,11 @@ class YeelightPCCompanionWindow(QMainWindow):
     def _refresh_device_summary(self):
         """The factual device line: an arbitrary number of devices, no fixed slots."""
         self.lbl_device_summary.setText(device_count_summary(self.config))
+        self._refresh_yeelight_health_display()
 
     def _restart_solar_thread(self):
+        self._cancel_yeelight_health_check()
+        self._last_solar_is_dark = None
         self.solar_thread.stop()
         self.solar_thread = SolarEngineThread(self.config_manager)
         self.solar_thread.solar_update.connect(self.on_solar_update)
@@ -3829,6 +3871,11 @@ class YeelightPCCompanionWindow(QMainWindow):
         )
 
     def on_solar_update(self, is_dark, status_text):
+        if self._last_solar_is_dark != is_dark:
+            self._cancel_yeelight_health_check()
+            self._last_solar_is_dark = is_dark
+            if not self._automation_paused:
+                self._yeelight_health_timer.start(HEALTH_CHECK_SETTLE_MS)
         # Amber marks the night state, the accent marks daytime. The text names
         # the state, so the colour is never the only signal.
         self.lbl_sun_state.set_status(status_text, TONE_WARN if is_dark else TONE_ACCENT)
@@ -3845,6 +3892,123 @@ class YeelightPCCompanionWindow(QMainWindow):
         # It ensures that if the system is in a mismatched state (e.g. due to wake timing, crash, or clock drift),
         # it will automatically heal and align to the correct solar state.
         self.reconcile_solar_state(is_dark)
+
+    def _yeelight_health_can_run(self):
+        return not (
+            self._automation_paused
+            or self._exiting
+            or self._sleep_transition_active
+            or self._system_sleeping
+            or (self.restore_thread and self.restore_thread.isRunning())
+        )
+
+    def _cancel_yeelight_health_check(self):
+        self._yeelight_health_generation += 1
+        if self._yeelight_health_thread is not None:
+            self._yeelight_health_thread.requestInterruption()
+
+    def _start_yeelight_health_check(self):
+        self._yeelight_health_timer.start(HEALTH_CHECK_INTERVAL_MS)
+        if not self._yeelight_health_can_run() or self._yeelight_health_thread is not None:
+            return
+        if not self.load_config():
+            return
+        self._refresh_yeelight_health_display()
+        if not self.config.get("automation", {}).get("restore_apps_on_wake", True):
+            return
+        if not enabled_configured_devices(self.config):
+            return
+        worker = YeelightHealthCheckThread(self._yeelight_health_generation, self.config)
+        self._yeelight_health_thread = worker
+        worker.results_ready.connect(self._on_yeelight_health_results)
+        worker.finished.connect(self._on_yeelight_health_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_yeelight_health_finished(self):
+        if self.sender() is self._yeelight_health_thread:
+            self._yeelight_health_thread = None
+
+    def _on_yeelight_health_results(self, generation, config, results):
+        if generation != self._yeelight_health_generation or not self._yeelight_health_can_run():
+            return
+        if not self.load_config():
+            return
+        if config != self.config:
+            self._refresh_yeelight_health_display()
+            self._yeelight_health_timer.start(HEALTH_CHECK_SETTLE_MS)
+            return
+        self._yeelight_health_results = results
+        self._yeelight_health_config = config
+        self._yeelight_health_checked_at = datetime.now().strftime("%H:%M:%S")
+        self._refresh_yeelight_health_display()
+
+        off_devices = [result for result in results if result.state == "off"]
+        if not (
+            off_devices
+            and self._last_solar_is_dark is True
+            and self.config.get("automation", {}).get("restore_apps_on_wake", True)
+        ):
+            return
+        try:
+            if not calculate_solar_dark_state(self.config):
+                return
+        except Exception:
+            logging.exception("[YEELIGHT HEALTH] Cannot confirm nighttime; automatic sync skipped.")
+            return
+        now = time.monotonic()
+        if (
+            self._last_yeelight_recovery_at is not None
+            and now - self._last_yeelight_recovery_at < HEALTH_CHECK_INTERVAL_MS / 1000
+        ):
+            return
+        self._last_yeelight_recovery_at = now
+        self.last_self_heal_time = time.time()
+        logging.warning(
+            "[YEELIGHT HEALTH] %d nighttime bulb(s) confirmed OFF. Running Force System Sync.",
+            len(off_devices),
+        )
+        self.trigger_resume(automatic=True)
+
+    def _refresh_yeelight_health_display(self):
+        if self._yeelight_health_config is not None and self._yeelight_health_config != self.config:
+            self._yeelight_health_results = []
+            self._yeelight_health_config = None
+            self._yeelight_health_checked_at = None
+
+        results = self._yeelight_health_results
+        details = []
+        warning = False
+        for result in results:
+            if result.state == NOT_RESPONDING:
+                state = "Not responding (check power or network)"
+                warning = True
+            elif result.state == UNKNOWN:
+                detail = result.detail or "power status unavailable"
+                state = f"Unknown ({detail})"
+                warning = True
+            else:
+                state = "On" if result.state == "on" else "Off"
+                warning = warning or (result.state == "off" and self._last_solar_is_dark is True)
+            details.append(f"{result.name} ({result.ip}): {state}")
+
+        if not enabled_configured_devices(self.config):
+            summary = "No enabled devices"
+        elif not results:
+            summary = "Not checked yet"
+        else:
+            summary = f"Checked {self._yeelight_health_checked_at}"
+            if warning:
+                summary += " - needs attention"
+        detail_text = "\n".join(details)
+        tone = TONE_WARN if warning else TONE_NEUTRAL
+        self.lbl_yeelight_health.setText(summary)
+        self.lbl_yeelight_health.setStyleSheet(text_qss(tone))
+        self.lbl_yeelight_health_details.setText(detail_text)
+        self.lbl_yeelight_health_details.setStyleSheet(text_qss(tone))
+        self.lbl_yeelight_health_details.setVisible(bool(details))
+        self.lbl_yeelight_device_health.setText("\n".join([summary, *details]))
+        self.lbl_yeelight_device_health.setStyleSheet(text_qss(tone))
 
     def reconcile_solar_state(self, is_dark):
         if self._automation_paused:
@@ -3994,8 +4158,15 @@ class YeelightPCCompanionWindow(QMainWindow):
         self._last_suspend_exec_time = now
         self._sleep_transition_active = True
         self._system_sleeping = True
+        health_worker = getattr(self, "_yeelight_health_thread", None)
+        if health_worker is not None:
+            try:
+                health_worker.requestInterruption()
+            except RuntimeError:
+                # Its finished signal may have deleted it on the GUI thread.
+                pass
         started = time.perf_counter()
-        if self.restore_thread and self.restore_thread.isRunning():
+        if self.restore_thread:
             logging.info("[SUSPEND] Cancelling active restoration thread before sleep.")
             self.restore_thread.running = False
 
@@ -4119,15 +4290,20 @@ class YeelightPCCompanionWindow(QMainWindow):
         elapsed = time.perf_counter() - started
         logging.info(f"[SUSPEND] Suspend sequence completed successfully in {elapsed:.3f}s.")
 
-    def trigger_resume(self):
+    def trigger_resume(self, *, automatic=False):
         """
         Launches async background thread to handle wake sequence.
         This prevents the main event loop from locking.
         """
         # Prevent starting duplicate threads or interrupting an ongoing restore
+        if automatic and not self._yeelight_health_can_run():
+            return
         if self.restore_thread and self.restore_thread.isRunning():
             logging.info("[POWER STATE EVENT] RESUME SIGNAL RECEIVED, but restoration is already running. Ignoring duplicate trigger.")
             return
+
+        self._cancel_yeelight_health_check()
+        self._yeelight_health_timer.start(HEALTH_CHECK_INTERVAL_MS)
 
         # Clean up old finished thread to prevent memory/resource leaks in PyQt
         if self.restore_thread:
@@ -4142,8 +4318,9 @@ class YeelightPCCompanionWindow(QMainWindow):
         except Exception:
             pass
             
-        self._sleep_transition_active = False
-        self._system_sleeping = False
+        if not automatic:
+            self._sleep_transition_active = False
+            self._system_sleeping = False
         automation = self.config.get("automation", {})
         if not automation.get("restore_apps_on_wake", True):
             logging.info("[POWER STATE EVENT] RESUME SIGNAL RECEIVED, but restoration is disabled in settings.")
@@ -4156,11 +4333,22 @@ class YeelightPCCompanionWindow(QMainWindow):
         self.restore_thread = RestoreEngineThread(self.config_manager)
         self.restore_thread.progress_update.connect(lambda msg: logging.info(msg))
         self.restore_thread.finished_sequence.connect(self.on_resume_completed)
+        # A native suspend callback can run between the initial guard and the
+        # worker's construction. Automatic recovery must never clear that state.
+        if automatic and (self._sleep_transition_active or self._system_sleeping):
+            self.restore_thread.running = False
+            return
         self.restore_thread.start()
 
     def on_resume_completed(self):
         self._set_system_status(SYSTEM_ACTIVE_TEXT, TONE_OK)
         self.check_system_statuses()
+        # finished_sequence is emitted just before QThread itself finishes.
+        if not (
+            self._automation_paused or self._exiting
+            or self._sleep_transition_active or self._system_sleeping
+        ):
+            self._yeelight_health_timer.start(HEALTH_CHECK_SETTLE_MS)
 
     def turn_off_devices_immediately(self, device_ips):
         """Synchronous, per-device turn-off used by the daytime self-healing.
@@ -4270,6 +4458,11 @@ class YeelightPCCompanionWindow(QMainWindow):
 
     def exit_app(self):
         logging.info("Shutting down Yeelight PC Companion...")
+        self._exiting = True
+        self._yeelight_health_timer.stop()
+        self._cancel_yeelight_health_check()
+        if self._yeelight_health_thread is not None:
+            self._yeelight_health_thread.wait(int(HEALTH_PROBE_TIMEOUT_SECONDS * 1000) + 1000)
         try:
             self.status_timer.stop()
         except Exception:
